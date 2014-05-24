@@ -1,6 +1,6 @@
 dnl Process this file with autoconf to produce a configure script.
 
-AC_INIT([linphone],[3.7.0],[linphone-developers@nongnu.org])
+AC_INIT([linphone],[zirgoo-1.0.1],[info@zirgoo.com])
 AC_CANONICAL_SYSTEM
 AC_CONFIG_SRCDIR([coreapi/linphonecore.c])
 
