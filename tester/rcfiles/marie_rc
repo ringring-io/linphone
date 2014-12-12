@@ -17,13 +17,13 @@ realm=sip.example.org
 [proxy_0]
 reg_proxy=sip.example.org;transport=tcp
 reg_route=sip.example.org;transport=tcp;lr
-reg_identity=sip:marie@sip.example.org
+reg_identity="Super Marie" <sip:marie@sip.example.org>
 reg_expires=3600
 reg_sendregister=1
 publish=0
 dial_escape_plus=0
-statistics_collector=sip:collector@sip.example.org
-send_statistics=1
+quality_reporting_collector=sip:collector@sip.example.org
+quality_reporting_enabled=1
 
 [friend_0]
 url="Paupoche" <sip:pauline@sip.example.org>
@@ -48,3 +48,6 @@ device=StaticImage: Static picture
 
 [sound]
 echocancellation=0 #to not overload cpu in case of VG
+
+[net]
+dns_srv_enabled=0 #no srv needed in general

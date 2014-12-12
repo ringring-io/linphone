@@ -48,13 +48,9 @@ public class LinphoneCoreFactoryImpl extends LinphoneCoreFactory {
 
 		// FFMPEG (audio/video)
 		if (Version.isX86()) {
-			loadOptionalLibrary("avutil-linphone-x86");
-			loadOptionalLibrary("swscale-linphone-x86");
-			loadOptionalLibrary("avcodec-linphone-x86");
+			loadOptionalLibrary("ffmpeg-linphone-x86");
 		} else if (Version.isArmv7()) {
-			loadOptionalLibrary("avutil-linphone-arm");
-			loadOptionalLibrary("swscale-linphone-arm");
-			loadOptionalLibrary("avcodec-linphone-arm");
+			loadOptionalLibrary("ffmpeg-linphone-arm");
 		}
 
 		//Main library
@@ -102,16 +98,12 @@ public class LinphoneCoreFactoryImpl extends LinphoneCoreFactory {
 	public LinphoneCore createLinphoneCore(LinphoneCoreListener listener, Object context) throws LinphoneCoreException {
 		try {
 			MediastreamerAndroidContext.setContext(context);
-			return new LinphoneCoreImpl(listener);
+			LinphoneCore lc = new LinphoneCoreImpl(listener);
+			if(context!=null) lc.setContext(context);
+			return lc;
 		} catch (IOException e) {
 			throw new LinphoneCoreException("Cannot create LinphoneCore",e);
 		}
-	}
-
-	@Override
-	public LinphoneProxyConfig createProxyConfig(String identity, String proxy,
-			String route, boolean enableRegister) throws LinphoneCoreException {
-		return new LinphoneProxyConfigImpl(identity,proxy,route,enableRegister);
 	}
 
 	@Override

@@ -367,8 +367,8 @@ static void linphonec_call_state_changed(LinphoneCore *lc, LinphoneCall *call, L
 			if ( auto_answer)  {
 				answer_call=TRUE;
 			} else if (real_early_media_sending) {
-				linphonec_out("Sending early media using real hardware\n");
 				LinphoneCallParams* callparams = linphone_core_create_default_call_parameters(lc);
+				linphonec_out("Sending early media using real hardware\n");
 				linphone_call_params_enable_early_media_sending(callparams, TRUE);
 				if (vcap_enabled) linphone_call_params_enable_video(callparams, TRUE);
 				linphone_core_accept_early_media_with_params(lc, call, callparams);
@@ -500,7 +500,6 @@ static void *pipe_thread(void*p){
 }
 
 static void start_pipe_reader(void){
-	ms_mutex_init(&prompt_mutex,NULL);
 	pipe_reader_run=TRUE;
 	ortp_thread_create(&pipe_reader_th,NULL,pipe_thread,NULL);
 }
@@ -536,6 +535,7 @@ char *linphonec_readline(char *prompt){
 		fprintf(stdout,"%s",prompt);
 		fflush(stdout);
 		while(1){
+			
 			ms_mutex_lock(&prompt_mutex);
 			if (have_prompt){
 				char *ret=strdup(received_prompt);
@@ -546,15 +546,17 @@ char *linphonec_readline(char *prompt){
 			ms_mutex_unlock(&prompt_mutex);
 			linphonec_idle_call();
 #ifdef WIN32
-			Sleep(20);
-			/* Following is to get the video window going as it
-				 should. Maybe should we only have this on when the option -V
-				 or -D is on? */
-			MSG msg;
-	
-			if (PeekMessage(&msg, NULL, 0, 0,1)) {
-				TranslateMessage(&msg);
-				DispatchMessage(&msg);
+			{
+				MSG msg;
+				Sleep(20);
+				/* Following is to get the video window going as it
+					should. Maybe should we only have this on when the option -V
+					or -D is on? */
+
+				if (PeekMessage(&msg, NULL, 0, 0,1)) {
+					TranslateMessage(&msg);
+					DispatchMessage(&msg);
+				}
 			}
 #else
 			usleep(20000);
@@ -648,7 +650,7 @@ main (int argc, char *argv[]) {
 	linphonec_vtable.refer_received=linphonec_display_refer;
 	linphonec_vtable.transfer_state_changed=linphonec_transfer_state_changed;
 	linphonec_vtable.call_encryption_changed=linphonec_call_encryption_changed;
-	
+
 	if (! linphonec_init(argc, argv) ) exit(EXIT_FAILURE);
 
 	linphonec_main_loop (linphonec);
@@ -671,8 +673,8 @@ linphonec_init(int argc, char **argv)
 	 * Set initial values for global variables
 	 */
 	mylogfile = NULL;
-	
-	
+
+
 #ifndef _WIN32
 	snprintf(configfile_name, PATH_MAX, "%s/.linphonerc",
 			getenv("HOME"));
@@ -701,7 +703,6 @@ linphonec_init(int argc, char **argv)
 		default:
 			break;
 	}
-
 #ifdef ENABLE_NLS
 	if (NULL == bindtextdomain (GETTEXT_PACKAGE, PACKAGE_LOCALE_DIR))
 		perror ("bindtextdomain failed");
@@ -741,12 +742,14 @@ linphonec_init(int argc, char **argv)
 	 * Initialize linphone core
 	 */
 	linphonec=linphone_core_new (&linphonec_vtable, configfile_name, factory_configfile_name, NULL);
+
+	linphone_core_set_user_agent(linphonec,"Linphonec", LINPHONE_VERSION);
 	linphone_core_set_zrtp_secrets_file(linphonec,zrtpsecrets);
 	linphone_core_enable_video_capture(linphonec, vcap_enabled);
 	linphone_core_enable_video_display(linphonec, display_enabled);
-	if (display_enabled && window_id != 0) 
+	if (display_enabled && window_id != 0)
 	{
-		printf ("Setting window_id: 0x%x\n", window_id);
+		printf("Setting window_id: 0x%x\n", window_id);
 		linphone_core_set_native_video_window_id(linphonec,window_id);
 	}
 
@@ -782,7 +785,7 @@ linphonec_finish(int exit_status)
 {
 	// Do not allow concurrent destroying to prevent glibc errors
 	static bool_t terminating=FALSE;
-	if (terminating) return; 
+	if (terminating) return;
 	terminating=TRUE;
 	linphonec_out("Terminating...\n");
 
@@ -801,6 +804,7 @@ linphonec_finish(int exit_status)
 	if (mylogfile != NULL && mylogfile != stdout)
 	{
 		fclose (mylogfile);
+		mylogfile=stdout;
 	}
 	printf("\n");
 	exit(exit_status);
@@ -827,12 +831,13 @@ linphonec_prompt_for_auth_final(LinphoneCore *lc)
 #ifdef HAVE_READLINE
 	rl_hook_func_t *old_event_hook;
 #endif
+	LinphoneAuthInfo *pending_auth;
 
 	if (reentrancy!=0) return 0;
-	
+
 	reentrancy++;
-	
-	LinphoneAuthInfo *pending_auth=auth_stack.elem[auth_stack.nitems-1];
+
+	pending_auth=auth_stack.elem[auth_stack.nitems-1];
 
 	snprintf(auth_prompt, 256, "Password for %s on %s: ",
 		pending_auth->username, pending_auth->realm);
@@ -1159,7 +1164,6 @@ linphonec_main_loop (LinphoneCore * opm)
 			add_history(iptr);
 		}
 #endif
-
 		linphonec_parse_command_line(linphonec, iptr);
 		linphonec_command_finished();
 		free(input);

@@ -21,12 +21,14 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "linphonecore_jni.h"
 #endif
 #include "linphonecore_utils.h"
-#include <ortp/zrtp.h>
+#include <mediastreamer2/zrtp.h>
 
 
 extern "C" {
 #include "mediastreamer2/mediastream.h"
 #include "mediastreamer2/mscommon.h"
+#include "mediastreamer2/dsptools.h"
+#include "mediastreamer2/msmediaplayer.h"
 }
 #include "mediastreamer2/msjava.h"
 #include "private.h"
@@ -52,12 +54,14 @@ extern "C" void libmssilk_init();
 #ifdef HAVE_G729
 extern "C" void libmsbcg729_init();
 #endif
-#ifdef HAVE_ISAC
-extern "C" void libmsisac_init();
+#ifdef HAVE_WEBRTC
+extern "C" void libmswebrtc_init();
 #endif
+#include <belle-sip/wakelock.h>
 #endif /*ANDROID*/
 
-
+/*force linking of ms_audio_diff symbol because the tester requires it.*/
+static void *audiodiff=(void*)&ms_audio_diff;
 
 #define RETURN_USER_DATA_OBJECT(javaclass, funcprefix, cobj) \
 	{ \
@@ -75,8 +79,6 @@ extern "C" void libmsisac_init();
 		} \
 		return jUserDataObj; \
 	}
-
-
 
 static JavaVM *jvm=0;
 static const char* LogDomain = "Linphone";
@@ -121,7 +123,13 @@ static void linphone_android_ortp_log_handler(OrtpLogLevel lev, const char *fmt,
 	}
 	if (handler_obj){
 		JNIEnv *env=ms_get_jni_env();
-		env->CallVoidMethod(handler_obj,loghandler_id,env->NewStringUTF(LogDomain),(jint)lev,env->NewStringUTF(levname),env->NewStringUTF(str),NULL);
+		jstring jdomain=env->NewStringUTF(LogDomain);
+		jstring jlevname=env->NewStringUTF(levname);
+		jstring jstr=env->NewStringUTF(str);
+		env->CallVoidMethod(handler_obj,loghandler_id,jdomain,(jint)lev,jlevname,jstr,NULL);
+		if (jdomain) env->DeleteLocalRef(jdomain);
+		if (jlevname) env->DeleteLocalRef(jlevname);
+		if (jstr) env->DeleteLocalRef(jstr);
 	}else
 		linphone_android_log_handler(prio, str);
 }
@@ -155,119 +163,291 @@ extern "C" void Java_org_linphone_core_LinphoneCoreFactoryImpl_setDebugMode(JNIE
 }
 // LinphoneCore
 
+/*
+ * returns the java LinphoneProxyConfig associated with a C LinphoneProxyConfig.
+**/
+jobject getProxy(JNIEnv *env, LinphoneProxyConfig *proxy, jobject core){
+	jobject jobj=0;
+
+	if (proxy!=NULL){
+		jclass proxyClass = (jclass)env->FindClass("org/linphone/core/LinphoneProxyConfigImpl");
+		jmethodID proxyCtrId = env->GetMethodID(proxyClass,"<init>", "(Lorg/linphone/core/LinphoneCoreImpl;J)V");
+
+		void *up=linphone_proxy_config_get_user_data(proxy);
+
+		if (up==NULL){
+			jobj=env->NewObject(proxyClass,proxyCtrId,core,(jlong)proxy);
+			linphone_proxy_config_set_user_data(proxy,(void*)env->NewWeakGlobalRef(jobj));
+			linphone_proxy_config_ref(proxy);
+		}else{
+			//promote the weak ref to local ref
+			jobj=env->NewLocalRef((jobject)up);
+			if (jobj == NULL){
+				//the weak ref was dead
+				jobj=env->NewObject(proxyClass,proxyCtrId,core,(jlong)proxy);
+				linphone_proxy_config_set_user_data(proxy,(void*)env->NewWeakGlobalRef(jobj));
+			}
+		}
+		env->DeleteLocalRef(proxyClass);
+	}
+	return jobj;
+}
+
+jobject getCall(JNIEnv *env, LinphoneCall *call){
+	jobject jobj=0;
+
+	if (call!=NULL){
+		jclass callClass = (jclass)env->FindClass("org/linphone/core/LinphoneCallImpl");
+		jmethodID callCtrId = env->GetMethodID(callClass,"<init>", "(J)V");
+
+		void *up=linphone_call_get_user_pointer(call);
+
+		if (up==NULL){
+			jobj=env->NewObject(callClass,callCtrId,(jlong)call);
+			jobj=env->NewGlobalRef(jobj);
+			linphone_call_set_user_pointer(call,(void*)jobj);
+			linphone_call_ref(call);
+		}else{
+			jobj=(jobject)up;
+		}
+		env->DeleteLocalRef(callClass);
+	}
+	return jobj;
+}
+
+jobject getChatMessage(JNIEnv *env, LinphoneChatMessage *msg){
+	jobject jobj = 0;
+
+	if (msg != NULL){
+		jclass chatMessageClass = (jclass)env->FindClass("org/linphone/core/LinphoneChatMessageImpl");
+		jmethodID chatMessageCtrId = env->GetMethodID(chatMessageClass,"<init>", "(J)V");
+
+		void *up = linphone_chat_message_get_user_data(msg);
+
+		if (up == NULL) {
+			jobj = env->NewObject(chatMessageClass,chatMessageCtrId,(jlong)linphone_chat_message_ref(msg));
+			jobj = env->NewGlobalRef(jobj);
+			linphone_chat_message_set_user_data(msg,(void*)jobj);
+		} else {
+			jobj = (jobject)up;
+		}
+		env->DeleteLocalRef(chatMessageClass);
+	}
+	return jobj;
+}
+
+jobject getEvent(JNIEnv *env, LinphoneEvent *lev){
+	if (lev==NULL) return NULL;
+	jobject jev=(jobject)linphone_event_get_user_data(lev);
+	if (jev==NULL){
+		jclass linphoneEventClass = (jclass)env->FindClass("org/linphone/core/LinphoneEventImpl");
+		jmethodID linphoneEventCtrId = env->GetMethodID(linphoneEventClass,"<init>", "(J)V");
+
+		jev=env->NewObject(linphoneEventClass,linphoneEventCtrId,(jlong)linphone_event_ref(lev));
+		jev=env->NewGlobalRef(jev);
+		linphone_event_set_user_data(lev,jev);
+
+		env->DeleteLocalRef(linphoneEventClass);
+	}
+	return jev;
+}
+
 class LinphoneCoreData {
 public:
-	LinphoneCoreData(JNIEnv*  env, jobject lc,jobject alistener, jobject auserdata) {
-
+	LinphoneCoreData(JNIEnv *env, jobject lc, LinphoneCoreVTable *vTable, jobject alistener) {
 		core = env->NewGlobalRef(lc);
 		listener = env->NewGlobalRef(alistener);
-		userdata = auserdata?env->NewGlobalRef(auserdata):0;
-		memset(&vTable,0,sizeof(vTable));
-		vTable.show = showInterfaceCb;
-		vTable.auth_info_requested = authInfoRequested;
-		vTable.display_status = displayStatusCb;
-		vTable.display_message = displayMessageCb;
-		vTable.display_warning = displayMessageCb;
-		vTable.global_state_changed = globalStateChange;
-		vTable.registration_state_changed = registrationStateChange;
-		vTable.call_state_changed = callStateChange;
-		vTable.call_encryption_changed = callEncryptionChange;
-		vTable.text_received = text_received;
-		vTable.message_received = message_received;
-		vTable.is_composing_received = is_composing_received;
-		vTable.dtmf_received = dtmf_received;
-		vTable.new_subscription_requested = new_subscription_requested;
-		vTable.notify_presence_received = notify_presence_received;
-		vTable.call_stats_updated = callStatsUpdated;
-		vTable.transfer_state_changed = transferStateChanged;
-		vTable.info_received = infoReceived;
-		vTable.subscription_state_changed=subscriptionStateChanged;
-		vTable.notify_received=notifyReceived;
-		vTable.publish_state_changed=publishStateChanged;
-		vTable.configuring_status=configuringStatus;
 
-		listenerClass = (jclass)env->NewGlobalRef(env->GetObjectClass( alistener));
+		memset(vTable, 0, sizeof(LinphoneCoreVTable));
+
+		listenerClass = (jclass)env->NewGlobalRef(env->GetObjectClass(alistener));
 
 		/*displayStatus(LinphoneCore lc,String message);*/
 		displayStatusId = env->GetMethodID(listenerClass,"displayStatus","(Lorg/linphone/core/LinphoneCore;Ljava/lang/String;)V");
+		env->ExceptionClear();
+		if (displayStatusId) {
+			vTable->display_status = displayStatusCb;
+		}
 
 		/*void generalState(LinphoneCore lc,int state); */
-		globalStateId = env->GetMethodID(listenerClass,"globalState","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCore$GlobalState;Ljava/lang/String;)V");
 		globalStateClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneCore$GlobalState"));
 		globalStateFromIntId = env->GetStaticMethodID(globalStateClass,"fromInt","(I)Lorg/linphone/core/LinphoneCore$GlobalState;");
+		globalStateId = env->GetMethodID(listenerClass,"globalState","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCore$GlobalState;Ljava/lang/String;)V");
+		env->ExceptionClear();
+		if (globalStateId) {
+			vTable->global_state_changed = globalStateChange;
+		}
 
 		/*registrationState(LinphoneCore lc, LinphoneProxyConfig cfg, LinphoneCore.RegistrationState cstate, String smessage);*/
-		registrationStateId = env->GetMethodID(listenerClass,"registrationState","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneProxyConfig;Lorg/linphone/core/LinphoneCore$RegistrationState;Ljava/lang/String;)V");
 		registrationStateClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneCore$RegistrationState"));
 		registrationStateFromIntId = env->GetStaticMethodID(registrationStateClass,"fromInt","(I)Lorg/linphone/core/LinphoneCore$RegistrationState;");
+		registrationStateId = env->GetMethodID(listenerClass,"registrationState","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneProxyConfig;Lorg/linphone/core/LinphoneCore$RegistrationState;Ljava/lang/String;)V");
+		env->ExceptionClear();
+		if (registrationStateId) {
+			vTable->registration_state_changed = registrationStateChange;
+		}
 
 		/*callState(LinphoneCore lc, LinphoneCall call, LinphoneCall.State cstate,String message);*/
-		callStateId = env->GetMethodID(listenerClass,"callState","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCall;Lorg/linphone/core/LinphoneCall$State;Ljava/lang/String;)V");
 		callStateClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneCall$State"));
 		callStateFromIntId = env->GetStaticMethodID(callStateClass,"fromInt","(I)Lorg/linphone/core/LinphoneCall$State;");
+		callStateId = env->GetMethodID(listenerClass,"callState","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCall;Lorg/linphone/core/LinphoneCall$State;Ljava/lang/String;)V");
+		env->ExceptionClear();
+		if (callStateId) {
+			vTable->call_state_changed = callStateChange;
+		}
 
 		transferStateId = env->GetMethodID(listenerClass,"transferState","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCall;Lorg/linphone/core/LinphoneCall$State;)V");
+		env->ExceptionClear();
+		if (transferStateId) {
+			vTable->transfer_state_changed = transferStateChanged;
+		}
 
 		/*callStatsUpdated(LinphoneCore lc, LinphoneCall call, LinphoneCallStats stats);*/
 		callStatsUpdatedId = env->GetMethodID(listenerClass, "callStatsUpdated", "(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCall;Lorg/linphone/core/LinphoneCallStats;)V");
-
-		chatMessageStateClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneChatMessage$State"));
-		chatMessageStateFromIntId = env->GetStaticMethodID(chatMessageStateClass,"fromInt","(I)Lorg/linphone/core/LinphoneChatMessage$State;");
+		env->ExceptionClear();
+		if (callStatsUpdatedId) {
+			vTable->call_stats_updated = callStatsUpdated;
+		}
 
 		/*callEncryption(LinphoneCore lc, LinphoneCall call, boolean encrypted,String auth_token);*/
-		callEncryptionChangedId=env->GetMethodID(listenerClass,"callEncryptionChanged","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCall;ZLjava/lang/String;)V");
+		callEncryptionChangedId = env->GetMethodID(listenerClass,"callEncryptionChanged","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCall;ZLjava/lang/String;)V");
+		env->ExceptionClear();
+		if (callEncryptionChangedId) {
+			vTable->call_encryption_changed = callEncryptionChange;
+		}
 
 		/*void ecCalibrationStatus(LinphoneCore.EcCalibratorStatus status, int delay_ms, Object data);*/
-		ecCalibrationStatusId = env->GetMethodID(listenerClass,"ecCalibrationStatus","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCore$EcCalibratorStatus;ILjava/lang/Object;)V");
 		ecCalibratorStatusClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneCore$EcCalibratorStatus"));
 		ecCalibratorStatusFromIntId = env->GetStaticMethodID(ecCalibratorStatusClass,"fromInt","(I)Lorg/linphone/core/LinphoneCore$EcCalibratorStatus;");
+		ecCalibrationStatusId = env->GetMethodID(listenerClass,"ecCalibrationStatus","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCore$EcCalibratorStatus;ILjava/lang/Object;)V");
+		env->ExceptionClear();
 
 		/*void newSubscriptionRequest(LinphoneCore lc, LinphoneFriend lf, String url)*/
 		newSubscriptionRequestId = env->GetMethodID(listenerClass,"newSubscriptionRequest","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneFriend;Ljava/lang/String;)V");
+		env->ExceptionClear();
+		if (newSubscriptionRequestId) {
+			vTable->new_subscription_requested = new_subscription_requested;
+		}
 
 		authInfoRequestedId = env->GetMethodID(listenerClass,"authInfoRequested","(Lorg/linphone/core/LinphoneCore;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+		env->ExceptionClear();
+		if (authInfoRequestedId) {
+			vTable->auth_info_requested = authInfoRequested;
+		}
 
 		/*void notifyPresenceReceived(LinphoneCore lc, LinphoneFriend lf);*/
 		notifyPresenceReceivedId = env->GetMethodID(listenerClass,"notifyPresenceReceived","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneFriend;)V");
+		env->ExceptionClear();
+		if (notifyPresenceReceivedId) {
+			vTable->notify_presence_received = notify_presence_received;
+		}
 
 		/*void textReceived(LinphoneCore lc, LinphoneChatRoom cr,LinphoneAddress from,String message);*/
 		textReceivedId = env->GetMethodID(listenerClass,"textReceived","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneChatRoom;Lorg/linphone/core/LinphoneAddress;Ljava/lang/String;)V");
+		env->ExceptionClear();
+		if (textReceivedId) {
+			vTable->text_received = text_received;
+		}
+
 		messageReceivedId = env->GetMethodID(listenerClass,"messageReceived","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneChatRoom;Lorg/linphone/core/LinphoneChatMessage;)V");
+		env->ExceptionClear();
+		if (messageReceivedId) {
+			vTable->message_received = message_received;
+		}
+
 		isComposingReceivedId = env->GetMethodID(listenerClass,"isComposingReceived","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneChatRoom;)V");
+		env->ExceptionClear();
+		if (isComposingReceivedId) {
+			vTable->is_composing_received = is_composing_received;
+		}
+
 		dtmfReceivedId = env->GetMethodID(listenerClass,"dtmfReceived","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCall;I)V");
-		infoReceivedId = env->GetMethodID(listenerClass,"infoReceived",
-										  "(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCall;Lorg/linphone/core/LinphoneInfoMessage;)V");
+		env->ExceptionClear();
+		if (dtmfReceivedId) {
+			vTable->dtmf_received = dtmf_received;
+		}
 
-		subscriptionStateId = env->GetMethodID(listenerClass,"subscriptionStateChanged",
-										  "(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneEvent;Lorg/linphone/core/SubscriptionState;)V");
-		publishStateId = env->GetMethodID(listenerClass,"publishStateChanged",
-										  "(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneEvent;Lorg/linphone/core/PublishState;)V");
-		notifyRecvId = env->GetMethodID(listenerClass,"notifyReceived",
-										  "(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneEvent;Ljava/lang/String;Lorg/linphone/core/LinphoneContent;)V");
+		infoReceivedId = env->GetMethodID(listenerClass,"infoReceived", "(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCall;Lorg/linphone/core/LinphoneInfoMessage;)V");
+		env->ExceptionClear();
+		if (infoReceivedId) {
+			vTable->info_received = infoReceived;
+		}
 
+		subscriptionStateClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/SubscriptionState"));
+		subscriptionStateFromIntId = env->GetStaticMethodID(subscriptionStateClass,"fromInt","(I)Lorg/linphone/core/SubscriptionState;");
+		subscriptionStateId = env->GetMethodID(listenerClass,"subscriptionStateChanged", "(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneEvent;Lorg/linphone/core/SubscriptionState;)V");
+		env->ExceptionClear();
+		if (subscriptionStateId) {
+			vTable->subscription_state_changed = subscriptionStateChanged;
+		}
+
+		publishStateClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/PublishState"));
+		publishStateFromIntId = env->GetStaticMethodID(publishStateClass,"fromInt","(I)Lorg/linphone/core/PublishState;");
+		publishStateId = env->GetMethodID(listenerClass,"publishStateChanged", "(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneEvent;Lorg/linphone/core/PublishState;)V");
+		env->ExceptionClear();
+		if (publishStateId) {
+			vTable->publish_state_changed = publishStateChanged;
+		}
+
+		notifyRecvId = env->GetMethodID(listenerClass,"notifyReceived", "(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneEvent;Ljava/lang/String;Lorg/linphone/core/LinphoneContent;)V");
+		env->ExceptionClear();
+		if (notifyRecvId) {
+			vTable->notify_received = notifyReceived;
+		}
+
+		configuringStateClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneCore$RemoteProvisioningState"));
+		configuringStateFromIntId = env->GetStaticMethodID(configuringStateClass,"fromInt","(I)Lorg/linphone/core/LinphoneCore$RemoteProvisioningState;");
+		configuringStateId = env->GetMethodID(listenerClass,"configuringStatus","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCore$RemoteProvisioningState;Ljava/lang/String;)V");
+		env->ExceptionClear();
+		if (configuringStateId) {
+			vTable->configuring_status = configuringStatus;
+		}
+
+		fileTransferProgressIndicationId = env->GetMethodID(listenerClass, "fileTransferProgressIndication", "(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneChatMessage;Lorg/linphone/core/LinphoneContent;I)V");
+		env->ExceptionClear();
+		if (fileTransferProgressIndicationId) {
+			vTable->file_transfer_progress_indication = fileTransferProgressIndication;
+		}
+
+		fileTransferSendId = env->GetMethodID(listenerClass, "fileTransferSend", "(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneChatMessage;Lorg/linphone/core/LinphoneContent;Ljava/nio/ByteBuffer;I)I");
+		env->ExceptionClear();
+		if (fileTransferSendId) {
+			vTable->file_transfer_send = fileTransferSend;
+		}
+
+		fileTransferRecvId = env->GetMethodID(listenerClass, "fileTransferRecv", "(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneChatMessage;Lorg/linphone/core/LinphoneContent;[BI)V");
+		env->ExceptionClear();
+		if (fileTransferRecvId) {
+			vTable->file_transfer_recv = fileTransferRecv;
+		}
+
+		chatMessageStateClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneChatMessage$State"));
+		chatMessageStateFromIntId = env->GetStaticMethodID(chatMessageStateClass,"fromInt","(I)Lorg/linphone/core/LinphoneChatMessage$State;");
 
 		proxyClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneProxyConfigImpl"));
 		proxyCtrId = env->GetMethodID(proxyClass,"<init>", "(Lorg/linphone/core/LinphoneCoreImpl;J)V");
 
 		callClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneCallImpl"));
 		callCtrId = env->GetMethodID(callClass,"<init>", "(J)V");
+		callSetAudioStatsId = env->GetMethodID(callClass, "setAudioStats", "(Lorg/linphone/core/LinphoneCallStats;)V");
+		callSetVideoStatsId = env->GetMethodID(callClass, "setVideoStats", "(Lorg/linphone/core/LinphoneCallStats;)V");
 
 		chatMessageClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneChatMessageImpl"));
-		if (chatMessageClass) chatMessageCtrId = env->GetMethodID(chatMessageClass,"<init>", "(J)V");
+		if (chatMessageClass) {
+			chatMessageCtrId = env->GetMethodID(chatMessageClass,"<init>", "(J)V");
+		}
 
 		chatRoomClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneChatRoomImpl"));
 		chatRoomCtrId = env->GetMethodID(chatRoomClass,"<init>", "(J)V");
 
 		friendClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneFriendImpl"));;
-		friendCtrId =env->GetMethodID(friendClass,"<init>", "(J)V");
+		friendCtrId = env->GetMethodID(friendClass,"<init>", "(J)V");
 
 		addressClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneAddressImpl"));
-		addressCtrId =env->GetMethodID(addressClass,"<init>", "(J)V");
+		addressCtrId = env->GetMethodID(addressClass,"<init>", "(J)V");
 
 		callStatsClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneCallStatsImpl"));
 		callStatsId = env->GetMethodID(callStatsClass, "<init>", "(JJ)V");
-		callSetAudioStatsId = env->GetMethodID(callClass, "setAudioStats", "(Lorg/linphone/core/LinphoneCallStats;)V");
-		callSetVideoStatsId = env->GetMethodID(callClass, "setVideoStats", "(Lorg/linphone/core/LinphoneCallStats;)V");
 
 		infoMessageClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneInfoMessageImpl"));
 		infoMessageCtor = env->GetMethodID(infoMessageClass,"<init>", "(J)V");
@@ -275,18 +455,8 @@ public:
 		linphoneEventClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneEventImpl"));
 		linphoneEventCtrId = env->GetMethodID(linphoneEventClass,"<init>", "(J)V");
 
-		subscriptionStateClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/SubscriptionState"));
-		subscriptionStateFromIntId = env->GetStaticMethodID(subscriptionStateClass,"fromInt","(I)Lorg/linphone/core/SubscriptionState;");
-
-		publishStateClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/PublishState"));
-		publishStateFromIntId = env->GetStaticMethodID(publishStateClass,"fromInt","(I)Lorg/linphone/core/PublishState;");
-
 		subscriptionDirClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/SubscriptionDir"));
 		subscriptionDirFromIntId = env->GetStaticMethodID(subscriptionDirClass,"fromInt","(I)Lorg/linphone/core/SubscriptionDir;");
-
-		configuringStateId = env->GetMethodID(listenerClass,"configuringStatus","(Lorg/linphone/core/LinphoneCore;Lorg/linphone/core/LinphoneCore$RemoteProvisioningState;Ljava/lang/String;)V");
-		configuringStateClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneCore$RemoteProvisioningState"));
-		configuringStateFromIntId = env->GetStaticMethodID(configuringStateClass,"fromInt","(I)Lorg/linphone/core/LinphoneCore$RemoteProvisioningState;");
 	}
 
 	~LinphoneCoreData() {
@@ -294,7 +464,6 @@ public:
 		jvm->AttachCurrentThread(&env,NULL);
 		env->DeleteGlobalRef(core);
 		env->DeleteGlobalRef(listener);
-		if (userdata) env->DeleteGlobalRef(userdata);
 		env->DeleteGlobalRef(listenerClass);
 		env->DeleteGlobalRef(globalStateClass);
 		env->DeleteGlobalRef(configuringStateClass);
@@ -313,7 +482,6 @@ public:
 	}
 	jobject core;
 	jobject listener;
-	jobject userdata;
 
 	jclass listenerClass;
 	jmethodID displayStatusId;
@@ -394,14 +562,12 @@ public:
 	jclass subscriptionDirClass;
 	jmethodID subscriptionDirFromIntId;
 
+	jmethodID fileTransferProgressIndicationId;
+	jmethodID fileTransferSendId;
+	jmethodID fileTransferRecvId;
+
 	LinphoneCoreVTable vTable;
 
-	static void showInterfaceCb(LinphoneCore *lc) {
-
-	}
-	static void byeReceivedCb(LinphoneCore *lc, const char *from) {
-
-	}
 	static void displayStatusCb(LinphoneCore *lc, const char *message) {
 		JNIEnv *env = 0;
 		jint result = jvm->AttachCurrentThread(&env,NULL);
@@ -409,11 +575,13 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
-		env->CallVoidMethod(lcData->listener,lcData->displayStatusId,lcData->core,message ? env->NewStringUTF(message) : NULL);
-	}
-	static void displayMessageCb(LinphoneCore *lc, const char *message) {
-
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
+		jstring msg = message ? env->NewStringUTF(message) : NULL;
+		env->CallVoidMethod(lcData->listener,lcData->displayStatusId,lcData->core,msg);
+		if (msg) {
+			env->DeleteLocalRef(msg);
+		}
 	}
 	static void authInfoRequested(LinphoneCore *lc, const char *realm, const char *username, const char *domain) {
 		JNIEnv *env = 0;
@@ -422,13 +590,26 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
+		jstring r = realm ? env->NewStringUTF(realm) : NULL;
+		jstring u = username ? env->NewStringUTF(username) : NULL;
+		jstring d = domain ? env->NewStringUTF(domain) : NULL;
 		env->CallVoidMethod(lcData->listener,
 							lcData->authInfoRequestedId,
 							lcData->core,
-							realm ? env->NewStringUTF(realm):NULL,
-							username ? env->NewStringUTF(username) : NULL,
-							domain ? env->NewStringUTF(domain) : NULL);
+							r,
+							u,
+							d);
+		if (r) {
+			env->DeleteLocalRef(r);
+		}
+		if (u) {
+			env->DeleteLocalRef(u);
+		}
+		if (d) {
+			env->DeleteLocalRef(d);
+		}
 	}
 	static void globalStateChange(LinphoneCore *lc, LinphoneGlobalState gstate,const char* message) {
 		JNIEnv *env = 0;
@@ -437,44 +618,38 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
+		jstring msg = message ? env->NewStringUTF(message) : NULL;
 		env->CallVoidMethod(lcData->listener
 							,lcData->globalStateId
 							,lcData->core
 							,env->CallStaticObjectMethod(lcData->globalStateClass,lcData->globalStateFromIntId,(jint)gstate),
-							message ? env->NewStringUTF(message) : NULL);
+							msg);
+		if (msg) {
+			env->DeleteLocalRef(msg);
+		}
 	}
 	static void registrationStateChange(LinphoneCore *lc, LinphoneProxyConfig* proxy,LinphoneRegistrationState state,const char* message) {
 		JNIEnv *env = 0;
 		jint result = jvm->AttachCurrentThread(&env,NULL);
+		jobject jproxy;
 		if (result != 0) {
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
+		jstring msg = message ? env->NewStringUTF(message) : NULL;
 		env->CallVoidMethod(lcData->listener
 							,lcData->registrationStateId
 							,lcData->core
-							,env->NewObject(lcData->proxyClass,lcData->proxyCtrId,lcData->core,(jlong)proxy)
+							,(jproxy=getProxy(env,proxy,lcData->core))
 							,env->CallStaticObjectMethod(lcData->registrationStateClass,lcData->registrationStateFromIntId,(jint)state),
-							message ? env->NewStringUTF(message) : NULL);
-	}
-	jobject getCall(JNIEnv *env , LinphoneCall *call){
-		jobject jobj=0;
-
-		if (call!=NULL){
-			void *up=linphone_call_get_user_pointer(call);
-
-			if (up==NULL){
-				jobj=env->NewObject(callClass,callCtrId,(jlong)call);
-				jobj=env->NewGlobalRef(jobj);
-				linphone_call_set_user_pointer(call,(void*)jobj);
-				linphone_call_ref(call);
-			}else{
-				jobj=(jobject)up;
-			}
+							msg);
+		if (msg) {
+			env->DeleteLocalRef(msg);
 		}
-		return jobj;
 	}
 
 	static void callStateChange(LinphoneCore *lc, LinphoneCall* call,LinphoneCallState state,const char* message) {
@@ -485,16 +660,21 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
+		jstring msg = message ? env->NewStringUTF(message) : NULL;
 		env->CallVoidMethod(lcData->listener
 							,lcData->callStateId
 							,lcData->core
-							,(jcall=lcData->getCall(env,call))
+							,(jcall=getCall(env,call))
 							,env->CallStaticObjectMethod(lcData->callStateClass,lcData->callStateFromIntId,(jint)state),
-							message ? env->NewStringUTF(message) : NULL);
-		if (state==LinphoneCallReleased){
+							msg);
+		if (state==LinphoneCallReleased) {
 			linphone_call_set_user_pointer(call,NULL);
 			env->DeleteGlobalRef(jcall);
+		}
+		if (msg) {
+			env->DeleteLocalRef(msg);
 		}
 	}
 	static void callEncryptionChange(LinphoneCore *lc, LinphoneCall* call, bool_t encrypted,const char* authentication_token) {
@@ -504,11 +684,12 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
 		env->CallVoidMethod(lcData->listener
 							,lcData->callEncryptionChangedId
 							,lcData->core
-							,lcData->getCall(env,call)
+							,getCall(env,call)
 							,encrypted
 							,authentication_token ? env->NewStringUTF(authentication_token) : NULL);
 	}
@@ -519,7 +700,8 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
 		env->CallVoidMethod(lcData->listener
 							,lcData->notifyPresenceReceivedId
 							,lcData->core
@@ -532,7 +714,8 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
 		env->CallVoidMethod(lcData->listener
 							,lcData->newSubscriptionRequestId
 							,lcData->core
@@ -546,11 +729,12 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
 		env->CallVoidMethod(lcData->listener
 							,lcData->dtmfReceivedId
 							,lcData->core
-							,lcData->getCall(env,call)
+							,getCall(env,call)
 							,dtmf);
 	}
 	static void text_received(LinphoneCore *lc, LinphoneChatRoom *room, const LinphoneAddress *from, const char *message) {
@@ -560,7 +744,8 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
 		env->CallVoidMethod(lcData->listener
 							,lcData->textReceivedId
 							,lcData->core
@@ -569,19 +754,22 @@ public:
 							,message ? env->NewStringUTF(message) : NULL);
 	}
 	static void message_received(LinphoneCore *lc, LinphoneChatRoom *room, LinphoneChatMessage *msg) {
-			JNIEnv *env = 0;
-			jint result = jvm->AttachCurrentThread(&env,NULL);
-			if (result != 0) {
-				ms_error("cannot attach VM");
-				return;
-			}
-			LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
-			env->CallVoidMethod(lcData->listener
-								,lcData->messageReceivedId
-								,lcData->core
-								,env->NewObject(lcData->chatRoomClass,lcData->chatRoomCtrId,(jlong)room)
-								,env->NewObject(lcData->chatMessageClass,lcData->chatMessageCtrId,(jlong)msg));
+		JNIEnv *env = 0;
+		jobject jmsg;
+		jint result = jvm->AttachCurrentThread(&env,NULL);
+		if (result != 0) {
+			ms_error("cannot attach VM");
+			return;
 		}
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
+		/*note: we call linphone_chat_message_ref() because the application does not acquire the object when invoked from a callback*/
+		env->CallVoidMethod(lcData->listener
+							,lcData->messageReceivedId
+							,lcData->core
+							,env->NewObject(lcData->chatRoomClass,lcData->chatRoomCtrId,(jlong)room)
+							,(jmsg = getChatMessage(env, msg)));
+	}
 	static void is_composing_received(LinphoneCore *lc, LinphoneChatRoom *room) {
 		JNIEnv *env = 0;
 		jint result = jvm->AttachCurrentThread(&env,NULL);
@@ -589,7 +777,8 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
 		env->CallVoidMethod(lcData->listener
 							,lcData->isComposingReceivedId
 							,lcData->core
@@ -602,16 +791,22 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
-		env->CallVoidMethod(lcData->listener
-							,lcData->ecCalibrationStatusId
-							,lcData->core
-							,env->CallStaticObjectMethod(lcData->ecCalibratorStatusClass,lcData->ecCalibratorStatusFromIntId,(jint)status)
-							,delay_ms
-							,data ? data : NULL);
-		if (data != NULL &&status !=LinphoneEcCalibratorInProgress ) {
-			//final state, releasing global ref
-			env->DeleteGlobalRef((jobject)data);
+		
+		LinphoneCoreVTable *table = (LinphoneCoreVTable*) data;
+		if (table) {
+			LinphoneCoreData* lcData = (LinphoneCoreData*) linphone_core_v_table_get_user_data(table);
+			if (lcData->ecCalibrationStatusId) {
+				jobject state = env->CallStaticObjectMethod(lcData->ecCalibratorStatusClass, lcData->ecCalibratorStatusFromIntId, (jint)status);
+				env->CallVoidMethod(lcData->listener
+								,lcData->ecCalibrationStatusId
+								,lcData->core
+								,state
+								,delay_ms
+								,NULL);
+			}
+			if (status != LinphoneEcCalibratorInProgress) {
+				linphone_core_v_table_destroy(table);
+			}
 		}
 
 	}
@@ -624,9 +819,10 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
 		statsobj = env->NewObject(lcData->callStatsClass, lcData->callStatsId, (jlong)call, (jlong)stats);
-		callobj = lcData->getCall(env, call);
+		callobj = getCall(env, call);
 		if (stats->type == LINPHONE_CALL_STATS_AUDIO)
 			env->CallVoidMethod(callobj, lcData->callSetAudioStatsId, statsobj);
 		else
@@ -641,40 +837,31 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
 		env->CallVoidMethod(lcData->listener
 							,lcData->transferStateId
 							,lcData->core
-							,(jcall=lcData->getCall(env,call))
+							,(jcall=getCall(env,call))
 							,env->CallStaticObjectMethod(lcData->callStateClass,lcData->callStateFromIntId,(jint)remote_call_state)
 							);
 	}
 	static void infoReceived(LinphoneCore *lc, LinphoneCall*call, const LinphoneInfoMessage *info){
 		JNIEnv *env = 0;
 		jint result = jvm->AttachCurrentThread(&env,NULL);
-		jobject jcall;
 		if (result != 0) {
 			ms_error("cannot attach VM");
 			return;
 		}
 		LinphoneInfoMessage *copy_info=linphone_info_message_copy(info);
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
 		env->CallVoidMethod(lcData->listener
 							,lcData->infoReceivedId
 							,lcData->core
-							,lcData->getCall(env,call)
+							,getCall(env,call)
 							,env->NewObject(lcData->infoMessageClass,lcData->infoMessageCtor,(jlong)copy_info)
 							);
-	}
-	jobject getEvent(JNIEnv *env, LinphoneEvent *lev){
-		if (lev==NULL) return NULL;
-		jobject jev=(jobject)linphone_event_get_user_data(lev);
-		if (jev==NULL){
-			jev=env->NewObject(linphoneEventClass,linphoneEventCtrId,(jlong)linphone_event_ref(lev));
-			jev=env->NewGlobalRef(jev);
-			linphone_event_set_user_data(lev,jev);
-		}
-		return jev;
 	}
 	static void subscriptionStateChanged(LinphoneCore *lc, LinphoneEvent *ev, LinphoneSubscriptionState state){
 		JNIEnv *env = 0;
@@ -685,8 +872,9 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
-		jevent=lcData->getEvent(env,ev);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
+		jevent=getEvent(env,ev);
 		jstate=env->CallStaticObjectMethod(lcData->subscriptionStateClass,lcData->subscriptionStateFromIntId,(jint)state);
 		env->CallVoidMethod(lcData->listener
 							,lcData->subscriptionStateId
@@ -709,8 +897,9 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
-		jevent=lcData->getEvent(env,ev);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
+		jevent=getEvent(env,ev);
 		jstate=env->CallStaticObjectMethod(lcData->publishStateClass,lcData->publishStateFromIntId,(jint)state);
 		env->CallVoidMethod(lcData->listener
 							,lcData->publishStateId
@@ -727,8 +916,9 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
-		jevent=lcData->getEvent(env,ev);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
+		jevent=getEvent(env,ev);
 		env->CallVoidMethod(lcData->listener
 							,lcData->notifyRecvId
 							,lcData->core
@@ -745,21 +935,87 @@ public:
 			ms_error("cannot attach VM");
 			return;
 		}
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
 		env->CallVoidMethod(lcData->listener, lcData->configuringStateId, lcData->core, env->CallStaticObjectMethod(lcData->configuringStateClass,lcData->configuringStateFromIntId,(jint)status), message ? env->NewStringUTF(message) : NULL);
+	}
+
+	static void fileTransferProgressIndication(LinphoneCore *lc, LinphoneChatMessage *message, const LinphoneContent* content, size_t offset, size_t total) {
+		JNIEnv *env = 0;
+		jobject jmsg;
+		size_t progress = (offset * 100) / total;
+		jint result = jvm->AttachCurrentThread(&env,NULL);
+		if (result != 0) {
+			ms_error("cannot attach VM");
+			return;
+		}
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
+		env->CallVoidMethod(lcData->listener,
+				lcData->fileTransferProgressIndicationId,
+				lcData->core,
+				(jmsg = getChatMessage(env, message)),
+				content ? create_java_linphone_content(env, content) : NULL,
+				progress);
+	}
+
+	static void fileTransferSend(LinphoneCore *lc, LinphoneChatMessage *message, const LinphoneContent* content, char* buff, size_t* size) {
+		JNIEnv *env = 0;
+		jobject jmsg;
+		size_t asking = *size;
+		jint result = jvm->AttachCurrentThread(&env,NULL);
+		if (result != 0) {
+			ms_error("cannot attach VM");
+			return;
+		}
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
+		*size = env->CallIntMethod(lcData->listener,
+				lcData->fileTransferSendId,
+				lcData->core,
+				(jmsg = getChatMessage(env, message)),
+				content ? create_java_linphone_content(env, content) : NULL,
+				buff ? env->NewDirectByteBuffer(buff, asking) : NULL,
+				asking);
+	}
+
+	static void fileTransferRecv(LinphoneCore *lc, LinphoneChatMessage *message, const LinphoneContent* content, const char* buff, size_t size) {
+		JNIEnv *env = 0;
+		jobject jmsg;
+		jint result = jvm->AttachCurrentThread(&env,NULL);
+		if (result != 0) {
+			ms_error("cannot attach VM");
+			return;
+		}
+		LinphoneCoreVTable *table = linphone_core_get_current_vtable(lc);
+		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_v_table_get_user_data(table);
+
+		jbyteArray jbytes = env->NewByteArray(size);
+		env->SetByteArrayRegion(jbytes, 0, size, (jbyte*)buff);
+
+		env->CallVoidMethod(lcData->listener,
+				lcData->fileTransferRecvId,
+				lcData->core,
+				(jmsg = getChatMessage(env, message)),
+				content ? create_java_linphone_content(env, content) : NULL,
+				jbytes,
+				size);
 	}
 };
 
 extern "C" jlong Java_org_linphone_core_LinphoneCoreImpl_newLinphoneCore(JNIEnv*  env
-		,jobject  thiz
+		,jobject thiz
 		,jobject jlistener
 		,jstring juserConfig
 		,jstring jfactoryConfig
-		,jobject  juserdata){
+		,jobject juserdata){
 
 	const char* userConfig = juserConfig?env->GetStringUTFChars(juserConfig, NULL):NULL;
 	const char* factoryConfig = jfactoryConfig?env->GetStringUTFChars(jfactoryConfig, NULL):NULL;
-	LinphoneCoreData* ldata = new LinphoneCoreData(env,thiz,jlistener,juserdata);
+
+	LinphoneCoreVTable *vTable = linphone_core_v_table_new();
+	LinphoneCoreData* ldata = new LinphoneCoreData(env, thiz, vTable, jlistener);
+	linphone_core_v_table_set_user_data(vTable, ldata);
 
 	ms_init(); // Initialize mediastreamer2 before loading the plugins
 
@@ -781,27 +1037,49 @@ extern "C" jlong Java_org_linphone_core_LinphoneCoreImpl_newLinphoneCore(JNIEnv*
 #ifdef HAVE_G729
 	libmsbcg729_init();
 #endif
-#ifdef HAVE_ISAC
-	libmsisac_init();
+#ifdef HAVE_WEBRTC
+	libmswebrtc_init();
 #endif
 
-	jlong nativePtr = (jlong)linphone_core_new(	&ldata->vTable
-			,userConfig
-			,factoryConfig
-			,ldata);
-
+	jobject core = env->NewGlobalRef(thiz);
+	jlong nativePtr = (jlong)linphone_core_new(vTable, userConfig, factoryConfig, core);
 
 	if (userConfig) env->ReleaseStringUTFChars(juserConfig, userConfig);
 	if (factoryConfig) env->ReleaseStringUTFChars(jfactoryConfig, factoryConfig);
 	return nativePtr;
 }
-extern "C" void Java_org_linphone_core_LinphoneCoreImpl_delete(JNIEnv*  env
-		,jobject  thiz
-		,jlong lc) {
-	LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data((LinphoneCore*)lc);
+extern "C" void Java_org_linphone_core_LinphoneCoreImpl_delete(JNIEnv* env, jobject thiz, jlong lc) {
+	jobject core = (jobject)linphone_core_get_user_data((LinphoneCore*)lc);
 	linphone_core_destroy((LinphoneCore*)lc);
 	ms_exit();
-	delete lcData;
+	if (core) {
+		env->DeleteGlobalRef(core);
+	}
+}
+
+extern "C" void Java_org_linphone_core_LinphoneCoreImpl_addListener(JNIEnv* env, jobject thiz, jlong lc, jobject jlistener) {
+	LinphoneCoreVTable *vTable = linphone_core_v_table_new();
+	LinphoneCoreData* ldata = new LinphoneCoreData(env, thiz, vTable, jlistener);
+	linphone_core_v_table_set_user_data(vTable, ldata);
+	linphone_core_add_listener((LinphoneCore*)lc, vTable);
+}
+
+extern "C" void Java_org_linphone_core_LinphoneCoreImpl_removeListener(JNIEnv* env, jobject thiz, jlong lc, jobject jlistener) {
+	MSList* iterator;
+	LinphoneCore *core = (LinphoneCore*)lc;
+	jobject listener = env->NewGlobalRef(jlistener);
+	for (iterator = core->vtables; iterator != NULL; iterator = iterator->next) {
+		LinphoneCoreVTable *vTable = (LinphoneCoreVTable*)(iterator->data);
+		if (vTable) {
+			LinphoneCoreData *data = (LinphoneCoreData*) linphone_core_v_table_get_user_data(vTable);
+			if (data && env->IsSameObject(data->listener, listener)) {
+				linphone_core_remove_listener(core, vTable);
+				linphone_core_v_table_destroy(vTable);
+				break;
+			}
+		}
+	}
+	env->DeleteGlobalRef(listener);
 }
 
 extern "C" jint Java_org_linphone_core_LinphoneCoreImpl_migrateToMultiTransport(JNIEnv*  env
@@ -871,27 +1149,35 @@ extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setDefaultProxyConfig(	J
 		,jlong pc) {
 	linphone_core_set_default_proxy((LinphoneCore*)lc,(LinphoneProxyConfig*)pc);
 }
-extern "C" jlong Java_org_linphone_core_LinphoneCoreImpl_getDefaultProxyConfig(	JNIEnv*  env
+
+extern "C" jobject Java_org_linphone_core_LinphoneCoreImpl_getDefaultProxyConfig(JNIEnv*  env
 		,jobject  thiz
 		,jlong lc) {
 	LinphoneProxyConfig *config=0;
 	linphone_core_get_default_proxy((LinphoneCore*)lc,&config);
-	return (jlong)config;
+	if(config != 0) {
+		jobject jproxy = getProxy(env,config,thiz);
+		return jproxy;
+	} else {
+		return NULL;
+	}
 }
 
-extern "C" jlongArray Java_org_linphone_core_LinphoneCoreImpl_getProxyConfigList(JNIEnv* env, jobject thiz, jlong lc) {
+extern "C" jobjectArray Java_org_linphone_core_LinphoneCoreImpl_getProxyConfigList(JNIEnv* env, jobject thiz, jlong lc) {
 	const MSList* proxies = linphone_core_get_proxy_config_list((LinphoneCore*)lc);
 	int proxyCount = ms_list_size(proxies);
-	jlongArray jProxies = env->NewLongArray(proxyCount);
-	jlong *jInternalArray = env->GetLongArrayElements(jProxies, NULL);
+	jclass cls = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneProxyConfigImpl"));
+	jobjectArray jProxies = env->NewObjectArray(proxyCount,cls,NULL);
 
 	for (int i = 0; i < proxyCount; i++ ) {
-		jInternalArray[i] = (unsigned long) (proxies->data);
+		LinphoneProxyConfig* proxy = (LinphoneProxyConfig*)proxies->data;
+		jobject jproxy = getProxy(env,proxy,thiz);
+		if(jproxy != NULL){
+			env->SetObjectArrayElement(jProxies, i, jproxy);
+		}
 		proxies = proxies->next;
 	}
-
-	env->ReleaseLongArrayElements(jProxies, jInternalArray, 0);
-
+	env->DeleteGlobalRef(cls);
 	return jProxies;
 }
 
@@ -901,9 +1187,7 @@ extern "C" jint Java_org_linphone_core_LinphoneCoreImpl_addProxyConfig(	JNIEnv* 
 		,jlong lc
 		,jlong pc) {
 	LinphoneProxyConfig* proxy = (LinphoneProxyConfig*)pc;
-	linphone_proxy_config_set_user_data(proxy, env->NewGlobalRef(jproxyCfg));
-
-	return (jint)linphone_core_add_proxy_config((LinphoneCore*)lc,(LinphoneProxyConfig*)pc);
+	return (jint)linphone_core_add_proxy_config((LinphoneCore*)lc,proxy);
 }
 
 extern "C" void Java_org_linphone_core_LinphoneCoreImpl_removeProxyConfig(JNIEnv* env, jobject thiz, jlong lc, jlong proxy) {
@@ -969,17 +1253,15 @@ extern "C" jobject Java_org_linphone_core_LinphoneCoreImpl_invite(JNIEnv* env
 		,jlong lc
 		,jstring juri) {
 	const char* uri = env->GetStringUTFChars(juri, NULL);
-	LinphoneCoreData *lcd=(LinphoneCoreData*)linphone_core_get_user_data((LinphoneCore*)lc);
 	LinphoneCall* lCall = linphone_core_invite((LinphoneCore*)lc,uri);
 	env->ReleaseStringUTFChars(juri, uri);
-	return lcd->getCall(env,lCall);
+	return getCall(env,lCall);
 }
 extern "C" jobject Java_org_linphone_core_LinphoneCoreImpl_inviteAddress(JNIEnv* env
 		,jobject  thiz
 		,jlong lc
 		,jlong to) {
-	LinphoneCoreData *lcd=(LinphoneCoreData*)linphone_core_get_user_data((LinphoneCore*)lc);
-	return lcd->getCall(env, linphone_core_invite_address((LinphoneCore*)lc,(LinphoneAddress*)to));
+	return getCall(env, linphone_core_invite_address((LinphoneCore*)lc,(LinphoneAddress*)to));
 }
 
 extern "C" void Java_org_linphone_core_LinphoneCoreImpl_terminateCall(JNIEnv* env
@@ -1241,6 +1523,13 @@ extern "C" jboolean Java_org_linphone_core_LinphoneCoreImpl_isPayloadTypeEnabled
 	return (jboolean) linphone_core_payload_type_enabled((LinphoneCore*)lc, (PayloadType*)pt);
 }
 
+extern "C" jboolean Java_org_linphone_core_LinphoneCoreImpl_payloadTypeIsVbr(JNIEnv*  env
+																			,jobject  thiz
+																			,jlong lc
+																			,jlong pt) {
+	return (jboolean) linphone_core_payload_type_is_vbr((LinphoneCore*)lc, (PayloadType*)pt);
+}
+
 extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setPayloadTypeBitrate(JNIEnv*  env
 																			,jobject  thiz
 																			,jlong lc
@@ -1255,6 +1544,42 @@ extern "C" jint Java_org_linphone_core_LinphoneCoreImpl_getPayloadTypeBitrate(JN
 																			,jlong pt) {
 	return (jint)linphone_core_get_payload_type_bitrate((LinphoneCore*)lc,(PayloadType*)pt);
 }
+
+extern "C" void Java_org_linphone_core_LinphoneCoreImpl_enableAdaptiveRateControl(JNIEnv*  env
+																			,jobject  thiz
+																			,jlong lc
+																			,jboolean enable) {
+	linphone_core_enable_adaptive_rate_control((LinphoneCore*)lc, enable);
+}
+
+extern "C" jboolean Java_org_linphone_core_LinphoneCoreImpl_isAdaptiveRateControlEnabled(JNIEnv*  env
+																			,jobject  thiz
+																			,jlong lc
+																			) {
+	return (jboolean)linphone_core_adaptive_rate_control_enabled((LinphoneCore*)lc);
+}
+extern "C" jstring Java_org_linphone_core_LinphoneCoreImpl_getAdaptiveRateAlgorithm(JNIEnv*  env
+																			,jobject  thiz
+																			,jlong lc
+																			) {
+	const char* alg = linphone_core_get_adaptive_rate_algorithm((LinphoneCore*)lc);
+	if (alg) {
+		return env->NewStringUTF(alg);
+	} else {
+		return NULL;
+	}
+}
+
+extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setAdaptiveRateAlgorithm(JNIEnv*  env
+																			,jobject  thiz
+																			,jlong lc
+																			,jstring jalg) {
+	const char* alg = jalg?env->GetStringUTFChars(jalg, NULL):NULL;
+	linphone_core_set_adaptive_rate_algorithm((LinphoneCore*)lc,alg);
+	if (alg) env->ReleaseStringUTFChars(jalg, alg);
+
+}
+
 
 extern "C" void Java_org_linphone_core_LinphoneCoreImpl_enableEchoCancellation(JNIEnv*  env
 																			,jobject  thiz
@@ -1286,9 +1611,7 @@ extern "C" jobject Java_org_linphone_core_LinphoneCoreImpl_getCurrentCall(JNIEnv
 																			,jobject  thiz
 																			,jlong lc
 																			) {
-	LinphoneCoreData *lcdata=(LinphoneCoreData*)linphone_core_get_user_data((LinphoneCore*)lc);
-
-	return lcdata->getCall(env,linphone_core_get_current_call((LinphoneCore*)lc));
+	return getCall(env,linphone_core_get_current_call((LinphoneCore*)lc));
 }
 extern "C" void Java_org_linphone_core_LinphoneCoreImpl_addFriend(JNIEnv*  env
 																			,jobject  thiz
@@ -1437,11 +1760,11 @@ extern "C" jint Java_org_linphone_core_LinphoneCoreImpl_startEchoCalibration(JNI
 																				,jobject  thiz
 																				,jlong lc
 																				,jobject data) {
-	return (jint)linphone_core_start_echo_calibration((LinphoneCore*)lc
-													, LinphoneCoreData::ecCalibrationStatus
-													, NULL
-													, NULL
-													, data?env->NewGlobalRef(data):NULL);
+	LinphoneCoreVTable *vTable = linphone_core_v_table_new();
+	LinphoneCoreData* ldata = new LinphoneCoreData(env, thiz, vTable, data);
+	linphone_core_v_table_set_user_data(vTable, ldata);
+	
+	return (jint)linphone_core_start_echo_calibration((LinphoneCore*)lc, ldata->ecCalibrationStatus, NULL, NULL, vTable);
 
 }
 
@@ -1451,12 +1774,11 @@ extern "C" jboolean Java_org_linphone_core_LinphoneCoreImpl_needsEchoCalibration
 	const char *card=linphone_core_get_capture_device((LinphoneCore*)lc);
 	sndcard=ms_snd_card_manager_get_card(m,card);
 	if (sndcard == NULL){
-		ms_error("Could not get soundcard.");
+		ms_error("Could not get soundcard %s", card);
 		return TRUE;
 	}
 	if (ms_snd_card_get_capabilities(sndcard) & MS_SND_CARD_CAP_BUILTIN_ECHO_CANCELLER) return FALSE;
-	if (ms_snd_card_get_minimal_latency(sndcard)==0) return TRUE;
-	return FALSE;
+	return TRUE;
 }
 
 extern "C" jint Java_org_linphone_core_LinphoneCoreImpl_getMediaEncryption(JNIEnv*  env
@@ -1495,11 +1817,6 @@ extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setMediaEncryptionMandat
 	linphone_core_set_media_encryption_mandatory((LinphoneCore*)lc, yesno);
 }
 
-extern "C" jlong Java_org_linphone_core_LinphoneCoreImpl_createProxyConfig(JNIEnv* env, jobject thiz, jlong lc) {
-	LinphoneProxyConfig* proxy = linphone_core_create_proxy_config((LinphoneCore *)lc);
-	return (jlong) proxy;
-}
-
 /*
  * Class:     org_linphone_core_LinphoneCoreImpl
  * Method:    disableChat
@@ -1530,14 +1847,20 @@ extern "C" JNIEXPORT jboolean JNICALL Java_org_linphone_core_LinphoneCoreImpl_ch
 
 //ProxyConfig
 
-extern "C" jlong Java_org_linphone_core_LinphoneProxyConfigImpl_newLinphoneProxyConfig(JNIEnv*  env,jobject  thiz) {
-	LinphoneProxyConfig* proxy = linphone_proxy_config_new();
-	return  (jlong) proxy;
+extern "C" jlong Java_org_linphone_core_LinphoneProxyConfigImpl_createProxyConfig(JNIEnv* env, jobject thiz, jlong lc) {
+	LinphoneProxyConfig* proxy = linphone_core_create_proxy_config((LinphoneCore *)lc);
+	linphone_proxy_config_set_user_data(proxy,env->NewWeakGlobalRef(thiz));
+	return (jlong) proxy;
 }
 
-extern "C" void Java_org_linphone_core_LinphoneProxyConfigImpl_delete(JNIEnv*  env,jobject  thiz,jlong ptr) {
-	linphone_proxy_config_destroy((LinphoneProxyConfig*)ptr);
+extern "C" void  Java_org_linphone_core_LinphoneProxyConfigImpl_finalize(JNIEnv*  env
+																		,jobject  thiz
+																		,jlong ptr) {
+	LinphoneProxyConfig *proxy=(LinphoneProxyConfig*)ptr;
+	linphone_proxy_config_set_user_data(proxy,NULL);
+	linphone_proxy_config_unref(proxy);
 }
+
 extern "C" void Java_org_linphone_core_LinphoneProxyConfigImpl_setIdentity(JNIEnv* env,jobject thiz,jlong proxyCfg,jstring jidentity) {
 	const char* identity = env->GetStringUTFChars(jidentity, NULL);
 	linphone_proxy_config_set_identity((LinphoneProxyConfig*)proxyCfg,identity);
@@ -1699,6 +2022,15 @@ extern "C" jlong Java_org_linphone_core_LinphoneProxyConfigImpl_getErrorInfo(JNI
 	return (jlong)linphone_proxy_config_get_error_info((LinphoneProxyConfig *) ptr);
 }
 
+extern "C" jint Java_org_linphone_core_LinphoneProxyConfigImpl_getPublishExpires(JNIEnv*  env,jobject thiz,jlong ptr) {
+	return (jint)linphone_proxy_config_get_publish_expires((LinphoneProxyConfig *) ptr);
+}
+extern "C" void Java_org_linphone_core_LinphoneProxyConfigImpl_setPublishExpires(JNIEnv*  env
+																					,jobject thiz
+																					,jlong ptr
+																					,jint jval) {
+	linphone_proxy_config_set_publish_expires((LinphoneProxyConfig *) ptr, jval);
+}
 //Auth Info
 
 extern "C" jlong Java_org_linphone_core_LinphoneAuthInfoImpl_newLinphoneAuthInfo(JNIEnv* env
@@ -1946,6 +2278,12 @@ extern "C" jint Java_org_linphone_core_LinphoneAddressImpl_getTransport(JNIEnv* 
 	LinphoneTransportType transporttype = linphone_address_get_transport((LinphoneAddress*)ptr);
 	return (jint)transporttype;
 }
+extern "C" jint Java_org_linphone_core_LinphoneAddressImpl_getPort(JNIEnv*  env
+																		,jobject  thiz
+																		,jlong ptr) {
+	int port = linphone_address_get_port((LinphoneAddress*)ptr);
+	return (jint)port;
+}
 extern "C" jstring Java_org_linphone_core_LinphoneAddressImpl_toString(JNIEnv*  env
 																		,jobject  thiz
 																		,jlong ptr) {
@@ -1991,6 +2329,12 @@ extern "C" void Java_org_linphone_core_LinphoneAddressImpl_setTransport(JNIEnv* 
 																		,jlong address
 																		,jint jtransport) {
 	linphone_address_set_transport((LinphoneAddress*)address, (LinphoneTransportType) jtransport);
+}
+extern "C" void Java_org_linphone_core_LinphoneAddressImpl_setPort(JNIEnv*  env
+									,jobject  thiz
+									,jlong address
+									,jint jport) {
+	linphone_address_set_port((LinphoneAddress*)address, (LinphoneTransportType) jport);
 }
 
 //CallLog
@@ -2202,10 +2546,8 @@ JNIEXPORT jint JNICALL Java_org_linphone_core_LinphoneCallImpl_getTransferState(
  */
 JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneCallImpl_getTransfererCall(JNIEnv *env, jobject jCall, jlong callptr){
 	LinphoneCall *call=(LinphoneCall*)callptr;
-	LinphoneCore *lc=linphone_call_get_core(call);
-	LinphoneCoreData *lcdata=(LinphoneCoreData*)linphone_core_get_user_data(lc);
 	LinphoneCall *ret=linphone_call_get_transferer_call(call);
-	return lcdata->getCall(env,ret);
+	return getCall(env,ret);
 }
 
 /*
@@ -2215,10 +2557,8 @@ JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneCallImpl_getTransfererC
  */
 JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneCallImpl_getTransferTargetCall(JNIEnv *env, jobject jCall, jlong callptr){
 	LinphoneCall *call=(LinphoneCall*)callptr;
-	LinphoneCore *lc=linphone_call_get_core(call);
-	LinphoneCoreData *lcdata=(LinphoneCoreData*)linphone_core_get_user_data(lc);
 	LinphoneCall *ret=linphone_call_get_transfer_target_call(call);
-	return lcdata->getCall(env,ret);
+	return getCall(env,ret);
 }
 
 extern "C" void Java_org_linphone_core_LinphoneCallImpl_enableEchoCancellation(	JNIEnv*  env
@@ -2248,8 +2588,7 @@ extern "C" jboolean Java_org_linphone_core_LinphoneCallImpl_isEchoLimiterEnabled
 extern "C" jobject Java_org_linphone_core_LinphoneCallImpl_getReplacedCall(	JNIEnv*  env
 																		,jobject  thiz
 																		,jlong ptr) {
-	LinphoneCoreData *lcd=(LinphoneCoreData*)linphone_core_get_user_data(linphone_call_get_core((LinphoneCall*)ptr));
-	return lcd->getCall(env,linphone_call_get_replaced_call((LinphoneCall*)ptr));
+	return getCall(env,linphone_call_get_replaced_call((LinphoneCall*)ptr));
 }
 
 extern "C" jfloat Java_org_linphone_core_LinphoneCallImpl_getCurrentQuality(	JNIEnv*  env
@@ -2262,6 +2601,10 @@ extern "C" jfloat Java_org_linphone_core_LinphoneCallImpl_getAverageQuality(	JNI
 																		,jobject  thiz
 																		,jlong ptr) {
 	return (jfloat)linphone_call_get_average_quality((LinphoneCall*)ptr);
+}
+
+extern "C" jlong Java_org_linphone_core_LinphoneCallImpl_getPlayer(JNIEnv *env, jobject thiz, jlong callPtr) {
+	return (jlong)linphone_call_get_player((LinphoneCall *)callPtr);
 }
 
 //LinphoneFriend
@@ -2322,8 +2665,8 @@ extern "C" jobject Java_org_linphone_core_LinphoneFriendImpl_getCore(JNIEnv*  en
 																		,jlong ptr) {
 	LinphoneCore *lc=linphone_friend_get_core((LinphoneFriend*)ptr);
 	if (lc!=NULL){
-		LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
-		return lcData->core;
+		jobject core = (jobject)linphone_core_get_user_data(lc);
+		return core;
 	}
 	return NULL;
 }
@@ -2365,12 +2708,11 @@ extern "C" jlong Java_org_linphone_core_LinphoneCoreImpl_getFriendByAddress(JNIE
 	env->ReleaseStringUTFChars(jaddress, address);
 	return (jlong) lf;
 }
-//LinphoneChatRoom
-extern "C" jlongArray Java_org_linphone_core_LinphoneChatRoomImpl_getHistory(JNIEnv*  env
+
+extern "C" jlongArray _LinphoneChatRoomImpl_getHistory(JNIEnv*  env
 																		,jobject  thiz
 																		,jlong ptr
-																		,jint limit) {
-	MSList* history = linphone_chat_room_get_history((LinphoneChatRoom*)ptr, limit);
+																		,MSList* history) {
 	int historySize = ms_list_size(history);
 	jlongArray jHistory = env->NewLongArray(historySize);
 	jlong *jInternalArray = env->GetLongArrayElements(jHistory, NULL);
@@ -2385,6 +2727,21 @@ extern "C" jlongArray Java_org_linphone_core_LinphoneChatRoomImpl_getHistory(JNI
 	env->ReleaseLongArrayElements(jHistory, jInternalArray, 0);
 
 	return jHistory;
+}
+extern "C" jlongArray Java_org_linphone_core_LinphoneChatRoomImpl_getHistoryRange(JNIEnv*  env
+																		,jobject  thiz
+																		,jlong ptr
+																		,jint start
+																		,jint end) {
+	MSList* history = linphone_chat_room_get_history_range((LinphoneChatRoom*)ptr, start, end);
+	return _LinphoneChatRoomImpl_getHistory(env, thiz, ptr, history);
+}
+extern "C" jlongArray Java_org_linphone_core_LinphoneChatRoomImpl_getHistory(JNIEnv*  env
+																		,jobject  thiz
+																		,jlong ptr
+																		,jint limit) {
+	MSList* history = linphone_chat_room_get_history((LinphoneChatRoom*)ptr, limit);
+	return _LinphoneChatRoomImpl_getHistory(env, thiz, ptr, history);
 }
 extern "C" jlong Java_org_linphone_core_LinphoneChatRoomImpl_getPeerAddress(JNIEnv*  env
 																		,jobject  thiz
@@ -2423,6 +2780,11 @@ extern "C" jlong Java_org_linphone_core_LinphoneChatRoomImpl_createLinphoneChatM
 		env->ReleaseStringUTFChars(jurl, url);
 
 	return (jlong) chatMessage;
+}
+extern "C" jint Java_org_linphone_core_LinphoneChatRoomImpl_getHistorySize		(JNIEnv*  env
+																				  ,jobject  thiz
+																				  ,jlong ptr) {
+	return (jint) linphone_chat_room_get_history_size((LinphoneChatRoom*)ptr);
 }
 extern "C" jint Java_org_linphone_core_LinphoneChatRoomImpl_getUnreadMessagesCount(JNIEnv*  env
 																				  ,jobject  thiz
@@ -2465,17 +2827,72 @@ extern "C" void Java_org_linphone_core_LinphoneChatRoomImpl_destroy(JNIEnv*  env
 	linphone_chat_room_destroy((LinphoneChatRoom*)ptr);
 }
 
+extern "C" jlong Java_org_linphone_core_LinphoneChatRoomImpl_createFileTransferMessage(JNIEnv* env, jobject thiz, jlong ptr, jstring jname, jstring jtype, jstring jsubtype, jint data_size) {
+	LinphoneContentPrivate content = {0};
+	LinphoneChatMessage *message = NULL;
+
+	content.type = (char*)env->GetStringUTFChars(jtype, NULL);
+	content.subtype = (char*)env->GetStringUTFChars(jsubtype, NULL);
+	content.name = (char*)env->GetStringUTFChars(jname, NULL);
+	content.size = data_size;
+	message = linphone_chat_room_create_file_transfer_message((LinphoneChatRoom *)ptr, LINPHONE_CONTENT(&content));
+	env->ReleaseStringUTFChars(jtype, content.type);
+	env->ReleaseStringUTFChars(jsubtype, content.subtype);
+	env->ReleaseStringUTFChars(jname, content.name);
+
+	return (jlong) message;
+}
+
+extern "C" void Java_org_linphone_core_LinphoneChatMessageImpl_cancelFileTransfer(JNIEnv* env, jobject  thiz, jlong ptr) {
+	linphone_chat_message_cancel_file_transfer((LinphoneChatMessage *)ptr);
+}
+
+extern "C" jobject Java_org_linphone_core_LinphoneChatMessageImpl_getFileTransferInformation(JNIEnv* env, jobject  thiz, jlong ptr) {
+	const LinphoneContent *content = linphone_chat_message_get_file_transfer_information((LinphoneChatMessage *)ptr);
+	if (content)
+		return create_java_linphone_content(env, content);
+	return NULL;
+}
+
+extern "C" jstring Java_org_linphone_core_LinphoneChatMessageImpl_getAppData(JNIEnv* env, jobject  thiz, jlong ptr) {
+	const char * app_data = linphone_chat_message_get_appdata((LinphoneChatMessage *)ptr);
+	return app_data ? env->NewStringUTF(app_data) : NULL;
+}
+
+extern "C" void Java_org_linphone_core_LinphoneChatMessageImpl_setAppData(JNIEnv* env, jobject  thiz, jlong ptr, jstring appdata) {
+	const char * data = appdata ? env->GetStringUTFChars(appdata, NULL) : NULL;
+	linphone_chat_message_set_appdata((LinphoneChatMessage *)ptr, data);
+	if (appdata)
+		env->ReleaseStringUTFChars(appdata, data);
+}
+
+extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setFileTransferServer(JNIEnv* env, jobject thiz, jlong ptr, jstring server_url) {
+	const char * url = server_url ? env->GetStringUTFChars(server_url, NULL) : NULL;
+	linphone_core_set_file_transfer_server((LinphoneCore *)ptr, url);
+	if (server_url)
+		env->ReleaseStringUTFChars(server_url, url);
+}
+
+extern "C" jstring Java_org_linphone_core_LinphoneCoreImpl_getFileTransferServer(JNIEnv* env, jobject thiz, jlong ptr) {
+	const char * server_url = linphone_core_get_file_transfer_server((LinphoneCore *)ptr);
+	return server_url ? env->NewStringUTF(server_url) : NULL;
+}
+
 extern "C" void Java_org_linphone_core_LinphoneChatMessageImpl_store(JNIEnv*  env
 																			,jobject  thiz
 																			,jlong ptr) {
 	linphone_chat_message_store((LinphoneChatMessage*)ptr);
 }
 
-extern "C" jstring Java_org_linphone_core_LinphoneChatMessageImpl_getText(JNIEnv*  env
+extern "C" jbyteArray Java_org_linphone_core_LinphoneChatMessageImpl_getText(JNIEnv*  env
 																		,jobject  thiz
 																		,jlong ptr) {
-	jstring jvalue =env->NewStringUTF(linphone_chat_message_get_text((LinphoneChatMessage*)ptr));
-	return jvalue;
+	const char *message = linphone_chat_message_get_text((LinphoneChatMessage*)ptr);
+	size_t length = strlen(message);
+	jbyteArray array = env->NewByteArray(length);
+	env->SetByteArrayRegion(array, 0, length, (const jbyte*)message);
+
+	return array;
 }
 
 extern "C" jint Java_org_linphone_core_LinphoneChatMessageImpl_getReason(JNIEnv*  env
@@ -2527,6 +2944,12 @@ extern "C" jlong Java_org_linphone_core_LinphoneChatMessageImpl_getFrom(JNIEnv* 
 																		,jobject  thiz
 																		,jlong ptr) {
 	return (jlong) linphone_chat_message_get_from((LinphoneChatMessage*)ptr);
+}
+
+extern "C" jlong Java_org_linphone_core_LinphoneChatMessageImpl_getTo(JNIEnv*  env
+																		,jobject  thiz
+																		,jlong ptr) {
+	return (jlong) linphone_chat_message_get_to((LinphoneChatMessage*)ptr);
 }
 
 extern "C" jlong Java_org_linphone_core_LinphoneChatMessageImpl_getPeerAddress(JNIEnv*  env
@@ -2610,13 +3033,14 @@ static void chat_room_impl_callback(LinphoneChatMessage* msg, LinphoneChatMessag
 	jclass clazz = (jclass) env->GetObjectClass(listener);
 	jmethodID method = env->GetMethodID(clazz, "onLinphoneChatMessageStateChanged","(Lorg/linphone/core/LinphoneChatMessage;Lorg/linphone/core/LinphoneChatMessage$State;)V");
 	jobject jmessage=(jobject)linphone_chat_message_get_user_data(msg);
-	LinphoneCore *lc = linphone_chat_room_get_lc(linphone_chat_message_get_chat_room(msg));
-	LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
+
+	jclass chatMessageStateClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneChatMessage$State"));
+	jmethodID chatMessageStateFromIntId = env->GetStaticMethodID(chatMessageStateClass,"fromInt","(I)Lorg/linphone/core/LinphoneChatMessage$State;");
 	env->CallVoidMethod(
 			listener,
 			method,
 			jmessage,
-			env->CallStaticObjectMethod(lcData->chatMessageStateClass,lcData->chatMessageStateFromIntId,(jint)state));
+			env->CallStaticObjectMethod(chatMessageStateClass,chatMessageStateFromIntId,(jint)state));
 
 	if (state == LinphoneChatMessageStateDelivered || state == LinphoneChatMessageStateNotDelivered) {
 		env->DeleteGlobalRef(listener);
@@ -2624,6 +3048,15 @@ static void chat_room_impl_callback(LinphoneChatMessage* msg, LinphoneChatMessag
 		linphone_chat_message_set_user_data(msg,NULL);
 	}
 }
+
+extern "C" jobject Java_org_linphone_core_LinphoneChatRoomImpl_getCore(JNIEnv*  env
+																		,jobject  thiz
+																		,jlong chatroom_ptr){
+	LinphoneCore *lc=linphone_chat_room_get_core((LinphoneChatRoom*)chatroom_ptr);
+	jobject core = (jobject)linphone_core_get_user_data(lc);
+	return core;
+}
+
 extern "C" void Java_org_linphone_core_LinphoneChatRoomImpl_sendMessage2(JNIEnv*  env
 																		,jobject  thiz
 																		,jlong chatroom_ptr
@@ -2635,6 +3068,13 @@ extern "C" void Java_org_linphone_core_LinphoneChatRoomImpl_sendMessage2(JNIEnv*
 	linphone_chat_message_ref((LinphoneChatMessage*)messagePtr);
 	linphone_chat_message_set_user_data((LinphoneChatMessage*)messagePtr, message);
 	linphone_chat_room_send_message2((LinphoneChatRoom*)chatroom_ptr, (LinphoneChatMessage*)messagePtr, chat_room_impl_callback, (void*)listener);
+}
+
+extern "C" void Java_org_linphone_core_LinphoneChatMessageImpl_startFileDownload(JNIEnv* env, jobject  thiz, jlong ptr, jobject jlistener) {
+	jobject listener = env->NewGlobalRef(jlistener);
+	LinphoneChatMessage * message = (LinphoneChatMessage *)ptr;
+	message->cb_ud = listener;
+	linphone_chat_message_start_file_download(message, chat_room_impl_callback, NULL);
 }
 
 extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setVideoWindowId(JNIEnv* env
@@ -2676,6 +3116,19 @@ extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setDeviceRotation(JNIEnv
 	linphone_core_set_device_rotation((LinphoneCore*)lc,rotation);
 }
 
+extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setRemoteRingbackTone(JNIEnv *env, jobject thiz, jlong lc, jstring jtone){
+	const char* tone = NULL;
+	if (jtone) tone=env->GetStringUTFChars(jtone, NULL);
+	linphone_core_set_remote_ringback_tone((LinphoneCore*)lc,tone);
+	if (tone) env->ReleaseStringUTFChars(jtone,tone);
+}
+
+extern "C" jstring Java_org_linphone_core_LinphoneCoreImpl_getRemoteRingbackTone(JNIEnv *env, jobject thiz, jlong lc){
+	const char *ret= linphone_core_get_remote_ringback_tone((LinphoneCore*)lc);
+	if (ret==NULL) return NULL;
+	jstring jvalue =env->NewStringUTF(ret);
+	return jvalue;
+}
 
 extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setFirewallPolicy(JNIEnv *env, jobject thiz, jlong lc, jint enum_value){
 	linphone_core_set_firewall_policy((LinphoneCore*)lc,(LinphoneFirewallPolicy)enum_value);
@@ -2774,7 +3227,7 @@ extern "C" jboolean Java_org_linphone_core_LinphoneCallParamsImpl_getVideoEnable
 }
 
 extern "C" jboolean Java_org_linphone_core_LinphoneCallParamsImpl_localConferenceMode(JNIEnv *env, jobject thiz, jlong lcp){
-	return (jboolean)linphone_call_params_local_conference_mode((LinphoneCallParams*)lcp);
+	return (jboolean)linphone_call_params_get_local_conference_mode((LinphoneCallParams*)lcp);
 }
 
 extern "C" jstring Java_org_linphone_core_LinphoneCallParamsImpl_getCustomHeader(JNIEnv *env, jobject thiz, jlong lcp, jstring jheader_name){
@@ -2853,8 +3306,7 @@ extern "C" void Java_org_linphone_core_LinphoneCallImpl_stopRecording(JNIEnv *en
 }
 
 extern "C" jobject Java_org_linphone_core_LinphoneCoreImpl_inviteAddressWithParams(JNIEnv *env, jobject thiz, jlong lc, jlong addr, jlong params){
-	LinphoneCoreData *lcd=(LinphoneCoreData*)linphone_core_get_user_data((LinphoneCore*)lc);
-	return  lcd->getCall(env,linphone_core_invite_address_with_params((LinphoneCore *)lc, (const LinphoneAddress *)addr, (const LinphoneCallParams *)params));
+	return  getCall(env,linphone_core_invite_address_with_params((LinphoneCore *)lc, (const LinphoneAddress *)addr, (const LinphoneCallParams *)params));
 }
 
 extern "C" jint Java_org_linphone_core_LinphoneCoreImpl_updateAddressWithParams(JNIEnv *env, jobject thiz, jlong lc, jlong call, jlong params){
@@ -2936,6 +3388,66 @@ extern "C" void Java_org_linphone_core_LinphoneProxyConfigImpl_setPrivacy(JNIEnv
 
 extern "C" jint Java_org_linphone_core_LinphoneProxyConfigImpl_getPrivacy(JNIEnv*  env,jobject thiz,jlong ptr) {
 	return linphone_proxy_config_get_privacy((LinphoneProxyConfig *) ptr);
+}
+
+JNIEXPORT void JNICALL Java_org_linphone_core_LinphoneProxyConfigImpl_enableAvpf(JNIEnv *env, jobject thiz, jlong ptr, jboolean enable) {
+	linphone_proxy_config_enable_avpf((LinphoneProxyConfig *)ptr, (bool)enable);
+}
+
+JNIEXPORT jboolean JNICALL Java_org_linphone_core_LinphoneProxyConfigImpl_avpfEnabled(JNIEnv *env, jobject thiz, jlong ptr) {
+	return linphone_proxy_config_avpf_enabled((LinphoneProxyConfig *)ptr);
+}
+
+JNIEXPORT void JNICALL Java_org_linphone_core_LinphoneProxyConfigImpl_setAvpfRRInterval(JNIEnv *env, jobject thiz, jlong ptr, jint interval) {
+	linphone_proxy_config_set_avpf_rr_interval((LinphoneProxyConfig *)ptr, (uint8_t)interval);
+}
+
+JNIEXPORT jint JNICALL Java_org_linphone_core_LinphoneProxyConfigImpl_getAvpfRRInterval(JNIEnv *env, jobject thiz, jlong ptr) {
+	return (jint)linphone_proxy_config_get_avpf_rr_interval((LinphoneProxyConfig *)ptr);
+}
+
+
+
+JNIEXPORT void JNICALL Java_org_linphone_core_LinphoneProxyConfigImpl_enableQualityReporting(JNIEnv *env, jobject thiz, jlong ptr, jboolean enable) {
+	linphone_proxy_config_enable_quality_reporting((LinphoneProxyConfig *)ptr, (bool)enable);
+}
+
+JNIEXPORT jboolean JNICALL Java_org_linphone_core_LinphoneProxyConfigImpl_quality_reportingEnabled(JNIEnv *env, jobject thiz, jlong ptr) {
+	return linphone_proxy_config_quality_reporting_enabled((LinphoneProxyConfig *)ptr);
+}
+
+JNIEXPORT void JNICALL Java_org_linphone_core_LinphoneProxyConfigImpl_setQualityReportingInterval(JNIEnv *env, jobject thiz, jlong ptr, jint interval) {
+	linphone_proxy_config_set_quality_reporting_interval((LinphoneProxyConfig *)ptr, (uint8_t)interval);
+}
+
+JNIEXPORT jint JNICALL Java_org_linphone_core_LinphoneProxyConfigImpl_getQualityReportingInterval(JNIEnv *env, jobject thiz, jlong ptr) {
+	return (jint)linphone_proxy_config_get_quality_reporting_interval((LinphoneProxyConfig *)ptr);
+}
+
+JNIEXPORT void JNICALL Java_org_linphone_core_LinphoneProxyConfigImpl_setQualityReportingCollector(JNIEnv *env, jobject thiz, jlong ptr, jstring jcollector) {
+	if (jcollector){
+		const char *collector=env->GetStringUTFChars(jcollector, NULL);
+		linphone_proxy_config_set_quality_reporting_collector((LinphoneProxyConfig *)ptr, collector);
+		env->ReleaseStringUTFChars(jcollector,collector);
+	}
+}
+
+JNIEXPORT jstring JNICALL Java_org_linphone_core_LinphoneProxyConfigImpl_getQualityReportingCollector(JNIEnv *env, jobject thiz, jlong ptr) {
+	jstring jvalue = env->NewStringUTF(linphone_proxy_config_get_quality_reporting_collector((LinphoneProxyConfig *)ptr));
+	return jvalue;
+}
+
+JNIEXPORT void JNICALL Java_org_linphone_core_LinphoneProxyConfigImpl_setRealm(JNIEnv *env, jobject thiz, jlong ptr, jstring jrealm) {
+	if (jrealm){
+		const char *realm=env->GetStringUTFChars(jrealm, NULL);
+		linphone_proxy_config_set_realm((LinphoneProxyConfig *)ptr, realm);
+		env->ReleaseStringUTFChars(jrealm,realm);
+	}
+}
+
+JNIEXPORT jstring JNICALL Java_org_linphone_core_LinphoneProxyConfigImpl_getRealm(JNIEnv *env, jobject thiz, jlong ptr) {
+	jstring jvalue = env->NewStringUTF(linphone_proxy_config_get_realm((LinphoneProxyConfig *)ptr));
+	return jvalue;
 }
 
 extern "C" jint Java_org_linphone_core_LinphoneCallImpl_getDuration(JNIEnv*  env,jobject thiz,jlong ptr) {
@@ -3045,9 +3557,8 @@ extern "C" void Java_org_linphone_core_LinphoneCoreImpl_terminateAllCalls(JNIEnv
 	linphone_core_terminate_all_calls((LinphoneCore *) pCore);
 }
 extern "C" jobject Java_org_linphone_core_LinphoneCoreImpl_getCall(JNIEnv *env,jobject thiz,jlong pCore,jint position) {
-	LinphoneCoreData *lcd=(LinphoneCoreData*)linphone_core_get_user_data((LinphoneCore*)pCore);
 	LinphoneCall* lCall = (LinphoneCall*) ms_list_nth_data(linphone_core_get_calls((LinphoneCore *) pCore),position);
-	return lcd->getCall(env,lCall);
+	return getCall(env,lCall);
 }
 extern "C" jint Java_org_linphone_core_LinphoneCoreImpl_getCallsNb(JNIEnv *env,jobject thiz,jlong pCore) {
 	return (jint)ms_list_size(linphone_core_get_calls((LinphoneCore *) pCore));
@@ -3064,8 +3575,7 @@ extern "C" jint Java_org_linphone_core_LinphoneCoreImpl_transferCallToAnother(JN
 }
 
 extern "C" jobject Java_org_linphone_core_LinphoneCoreImpl_startReferedCall(JNIEnv *env, jobject thiz, jlong lc, jlong callptr, jlong params){
-	LinphoneCoreData *lcd=(LinphoneCoreData*)linphone_core_get_user_data((LinphoneCore*)lc);
-	return  lcd->getCall(env,linphone_core_start_refered_call((LinphoneCore *)lc, (LinphoneCall *)callptr, (const LinphoneCallParams *)params));
+	return  getCall(env,linphone_core_start_refered_call((LinphoneCore *)lc, (LinphoneCall *)callptr, (const LinphoneCallParams *)params));
 }
 
 extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setZrtpSecretsCache(JNIEnv *env,jobject thiz,jlong pCore, jstring jFile) {
@@ -3082,8 +3592,7 @@ extern "C" jobject Java_org_linphone_core_LinphoneCoreImpl_findCallFromUri(JNIEn
 	const char* cUri=env->GetStringUTFChars(jUri, NULL);
 	const LinphoneCall *call=linphone_core_find_call_from_uri((const LinphoneCore *) pCore,cUri);
 	env->ReleaseStringUTFChars(jUri, cUri);
-	LinphoneCoreData *lcdata=(LinphoneCoreData*)linphone_core_get_user_data((LinphoneCore*)pCore);
-	return (jobject) lcdata->getCall(env,(LinphoneCall*)call);
+	return (jobject) getCall(env,(LinphoneCall*)call);
 }
 
 
@@ -3207,6 +3716,60 @@ extern "C" void Java_org_linphone_core_LinphoneCoreImpl_tunnelAddServerAndMirror
 	env->ReleaseStringUTFChars(jHost, cHost);
 }
 
+extern "C" void Java_org_linphone_core_LinphoneCoreImpl_tunnelAddServer(JNIEnv *env, jobject thiz, jlong pCore, jobject config) {
+	LinphoneTunnel *tunnel = linphone_core_get_tunnel((LinphoneCore *)pCore);
+	if(tunnel != NULL) {
+		jclass TunnelConfigClass = env->FindClass("org/linphone/core/TunnelConfig");
+		jmethodID getHostMethod = env->GetMethodID(TunnelConfigClass, "getHost", "()Ljava/lang/String;");
+		jmethodID getPortMethod = env->GetMethodID(TunnelConfigClass, "getPort", "()I");
+		jmethodID getRemoteUdpMirrorPortMethod = env->GetMethodID(TunnelConfigClass, "getRemoteUdpMirrorPort", "()I");
+		jmethodID getDelayMethod = env->GetMethodID(TunnelConfigClass, "getDelay", "()I");
+		jstring hostString = (jstring)env->CallObjectMethod(config, getHostMethod);
+		const char *host = env->GetStringUTFChars(hostString, NULL);
+		if(host == NULL || strlen(host)==0) {
+			ms_error("LinphoneCore.tunnelAddServer(): no tunnel host defined");
+		}
+		LinphoneTunnelConfig *tunnelConfig = linphone_tunnel_config_new();
+		linphone_tunnel_config_set_host(tunnelConfig, host);
+		linphone_tunnel_config_set_port(tunnelConfig, env->CallIntMethod(config, getPortMethod));
+		linphone_tunnel_config_set_remote_udp_mirror_port(tunnelConfig, env->CallIntMethod(config, getRemoteUdpMirrorPortMethod));
+		linphone_tunnel_config_set_delay(tunnelConfig, env->CallIntMethod(config, getDelayMethod));
+		linphone_tunnel_add_server(tunnel, tunnelConfig);
+		env->ReleaseStringUTFChars(hostString, host);
+	} else {
+		ms_error("LinphoneCore.tunnelAddServer(): tunnel feature is not enabled");
+	}
+}
+
+extern "C" jobjectArray Java_org_linphone_core_LinphoneCoreImpl_tunnelGetServers(JNIEnv *env, jobject thiz, jlong pCore) {
+	LinphoneTunnel *tunnel = linphone_core_get_tunnel((LinphoneCore *)pCore);
+	jclass TunnelConfigClass = env->FindClass("org/linphone/core/TunnelConfig");
+	jmethodID setHostMethod = env->GetMethodID(TunnelConfigClass, "setHost", "(Ljava/lang/String;)V");
+	jmethodID setPortMethod = env->GetMethodID(TunnelConfigClass, "setPort", "(I)V");
+	jmethodID setRemoteUdpMirrorPortMethod = env->GetMethodID(TunnelConfigClass, "setRemoteUdpMirrorPort", "(I)V");
+	jmethodID setDelayMethod = env->GetMethodID(TunnelConfigClass, "setDelay", "(I)V");
+	jobjectArray tunnelConfigArray = NULL;
+
+	if(tunnel != NULL) {
+		const MSList *servers = linphone_tunnel_get_servers(tunnel);
+		const MSList *it;
+		int i;
+		ms_message("servers=%p", (void *)servers);
+		ms_message("taille=%i", ms_list_size(servers));
+		tunnelConfigArray = env->NewObjectArray(ms_list_size(servers), TunnelConfigClass, NULL);
+		for(it = servers, i=0; it != NULL; it = it->next, i++) {
+			const LinphoneTunnelConfig *conf = (const LinphoneTunnelConfig *)it->data;
+			jobject elt = env->AllocObject(TunnelConfigClass);
+			env->CallVoidMethod(elt, setHostMethod, env->NewStringUTF(linphone_tunnel_config_get_host(conf)));
+			env->CallVoidMethod(elt, setPortMethod, linphone_tunnel_config_get_port(conf));
+			env->CallVoidMethod(elt, setRemoteUdpMirrorPortMethod, linphone_tunnel_config_get_remote_udp_mirror_port(conf));
+			env->CallVoidMethod(elt, setDelayMethod, linphone_tunnel_config_get_delay(conf));
+			env->SetObjectArrayElement(tunnelConfigArray, i, elt);
+		}
+	}
+	return tunnelConfigArray;
+}
+
 extern "C" void Java_org_linphone_core_LinphoneCoreImpl_tunnelSetHttpProxy(JNIEnv *env,jobject thiz,jlong pCore,
 		jstring jHost, jint port, jstring username, jstring password) {
 
@@ -3237,6 +3800,37 @@ extern "C" void Java_org_linphone_core_LinphoneCoreImpl_tunnelEnable(JNIEnv *env
 	linphone_tunnel_enable(tunnel, enable);
 }
 
+extern "C" void Java_org_linphone_core_LinphoneCoreImpl_tunnelSetMode(JNIEnv *env, jobject thiz, jlong pCore, jint mode) {
+	LinphoneTunnel *tunnel = ((LinphoneCore *)pCore)->tunnel;
+	if(tunnel != NULL) {
+		linphone_tunnel_set_mode(tunnel, (LinphoneTunnelMode)mode);
+	}
+}
+
+extern "C" jint Java_org_linphone_core_LinphoneCoreImpl_tunnelGetMode(JNIEnv *env, jobject thiz, jlong pCore) {
+	LinphoneTunnel *tunnel = ((LinphoneCore *)pCore)->tunnel;
+	if(tunnel != NULL) {
+		return (jint)linphone_tunnel_get_mode(tunnel);
+	} else {
+		return 0;
+	}
+}
+
+extern "C" void Java_org_linphone_core_LinphoneCoreImpl_tunnelEnableSip(JNIEnv *env, jobject thiz, jlong pCore, jboolean enable) {
+	LinphoneTunnel *tunnel = ((LinphoneCore *)pCore)->tunnel;
+	if(tunnel != NULL) {
+		linphone_tunnel_enable_sip(tunnel, (bool_t)enable);
+	}
+}
+
+extern "C" jboolean Java_org_linphone_core_LinphoneCoreImpl_tunnelSipEnabled(JNIEnv *env, jobject thiz, jlong pCore) {
+	LinphoneTunnel *tunnel = ((LinphoneCore *)pCore)->tunnel;
+	if(tunnel != NULL) {
+		return (jboolean)linphone_tunnel_sip_enabled(tunnel);
+	} else {
+		return JNI_FALSE;
+	}
+}
 
 extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setUserAgent(JNIEnv *env,jobject thiz,jlong pCore, jstring name, jstring version){
 	const char* cname=env->GetStringUTFChars(name, NULL);
@@ -3277,6 +3871,14 @@ extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setCpuCountNative(JNIEnv
 	ms_set_cpu_count(count);
 }
 
+extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setAudioJittcomp(JNIEnv *env, jobject thiz, jlong lc, jint value) {
+	linphone_core_set_audio_jittcomp((LinphoneCore *)lc, value);
+}
+
+extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setVideoJittcomp(JNIEnv *env, jobject thiz, jlong lc, jint value) {
+	linphone_core_set_video_jittcomp((LinphoneCore *)lc, value);
+}
+
 extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setAudioPort(JNIEnv *env, jobject thiz, jlong lc, jint port) {
 	linphone_core_set_audio_port((LinphoneCore *)lc, port);
 }
@@ -3295,6 +3897,13 @@ extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setVideoPortRange(JNIEnv
 
 extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setAudioDscp(JNIEnv* env,jobject thiz,jlong ptr, jint dscp){
 	linphone_core_set_audio_dscp((LinphoneCore*)ptr,dscp);
+}
+
+extern "C" void Java_org_linphone_core_LinphoneCoreImpl_setAndroidPowerManager(JNIEnv *env, jclass cls, jobject pm) {
+#ifdef ANDROID
+	if(pm != NULL) bellesip_wake_lock_init(env, pm);
+	else bellesip_wake_lock_uninit(env);
+#endif
 }
 
 extern "C" jint Java_org_linphone_core_LinphoneCoreImpl_getAudioDscp(JNIEnv* env,jobject thiz,jlong ptr){
@@ -3349,11 +3958,10 @@ JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneCoreImpl_subscribe(JNIE
 		jstring jevname, jint expires, jstring jtype, jstring jsubtype, jbyteArray jdata, jstring jencoding){
 	LinphoneCore *lc=(LinphoneCore*)coreptr;
 	LinphoneAddress *addr=(LinphoneAddress*)addrptr;
-	LinphoneContent content={0};
+	LinphoneContentPrivate content={0};
 	LinphoneEvent *ev;
 	jobject jev=NULL;
 	const char *evname=env->GetStringUTFChars(jevname,NULL);
-	LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
 
 	if (jtype){
 		content.type=(char*)env->GetStringUTFChars(jtype,NULL);
@@ -3362,7 +3970,7 @@ JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneCoreImpl_subscribe(JNIE
 		content.data=(void*)env->GetByteArrayElements(jdata,NULL);
 		content.size=env->GetArrayLength(jdata);
 	}
-	ev=linphone_core_subscribe(lc,addr,evname,expires,content.type ? &content : NULL);
+	ev=linphone_core_subscribe(lc,addr,evname,expires,content.type ? LINPHONE_CONTENT(&content) : NULL);
 	if (jtype){
 		env->ReleaseStringUTFChars(jtype,content.type);
 		env->ReleaseStringUTFChars(jsubtype,content.subtype);
@@ -3371,7 +3979,7 @@ JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneCoreImpl_subscribe(JNIE
 	}
 	env->ReleaseStringUTFChars(jevname,evname);
 	if (ev){
-		jev=lcData->getEvent(env,ev);
+		jev=getEvent(env,ev);
 	}
 	return jev;
 }
@@ -3385,11 +3993,10 @@ JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneCoreImpl_publish(JNIEnv
 																		  jstring jtype, jstring jsubtype, jbyteArray jdata, jstring jencoding){
 	LinphoneCore *lc=(LinphoneCore*)coreptr;
 	LinphoneAddress *addr=(LinphoneAddress*)addrptr;
-	LinphoneContent content={0};
+	LinphoneContentPrivate content={0};
 	LinphoneEvent *ev;
 	jobject jev=NULL;
 	const char *evname=env->GetStringUTFChars(jevname,NULL);
-	LinphoneCoreData* lcData = (LinphoneCoreData*)linphone_core_get_user_data(lc);
 
 	if (jtype){
 		content.type=(char*)env->GetStringUTFChars(jtype,NULL);
@@ -3398,7 +4005,7 @@ JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneCoreImpl_publish(JNIEnv
 		content.data=(void*)env->GetByteArrayElements(jdata,NULL);
 		content.size=env->GetArrayLength(jdata);
 	}
-	ev=linphone_core_publish(lc,addr,evname,expires,content.type ? &content : NULL);
+	ev=linphone_core_publish(lc,addr,evname,expires,content.type ? LINPHONE_CONTENT(&content) : NULL);
 	if (jtype){
 		env->ReleaseStringUTFChars(jtype,content.type);
 		env->ReleaseStringUTFChars(jsubtype,content.subtype);
@@ -3407,7 +4014,7 @@ JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneCoreImpl_publish(JNIEnv
 	}
 	env->ReleaseStringUTFChars(jevname,evname);
 	if (ev){
-		jev=lcData->getEvent(env,ev);
+		jev=getEvent(env,ev);
 	}
 	return jev;
 }
@@ -3540,25 +4147,29 @@ extern "C" jintArray Java_org_linphone_core_LpConfigImpl_getIntRange(JNIEnv *env
 		return returnValues;
 }
 
-static jobject create_java_linphone_content(JNIEnv *env, const LinphoneContent *content){
+static jobject create_java_linphone_content(JNIEnv *env, const LinphoneContent *icontent){
 	jclass contentClass;
 	jmethodID ctor;
-	jstring jtype, jsubtype, jencoding;
-	jbyteArray jdata=NULL;
+	jstring jtype, jsubtype, jencoding, jname;
+	jbyteArray jdata = NULL;
+	jint jsize = 0;
+	const LinphoneContentPrivate *content = LINPHONE_CONTENT_PRIVATE(icontent);
 
 	contentClass = (jclass)env->NewGlobalRef(env->FindClass("org/linphone/core/LinphoneContentImpl"));
-	ctor = env->GetMethodID(contentClass,"<init>", "(Ljava/lang/String;Ljava/lang/String;[BLjava/lang/String;)V");
+	ctor = env->GetMethodID(contentClass,"<init>", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[BLjava/lang/String;I)V");
 
-	jtype=env->NewStringUTF(content->type);
-	jsubtype=env->NewStringUTF(content->subtype);
-	jencoding=content->encoding ? env->NewStringUTF(content->encoding) : NULL;
+	jtype = env->NewStringUTF(content->type);
+	jsubtype = env->NewStringUTF(content->subtype);
+	jencoding = content->encoding ? env->NewStringUTF(content->encoding) : NULL;
+	jname = content->name ? env->NewStringUTF(content->name) : NULL;
+	jsize = (jint) content->size;
 
 	if (content->data){
-		jdata=env->NewByteArray(content->size);
-		env->SetByteArrayRegion(jdata,0,content->size,(jbyte*)content->data);
+		jdata = env->NewByteArray(content->size);
+		env->SetByteArrayRegion(jdata, 0, content->size, (jbyte*)content->data);
 	}
 
-	jobject jobj=env->NewObject(contentClass,ctor,jtype, jsubtype, jdata,jencoding);
+	jobject jobj = env->NewObject(contentClass, ctor, jname, jtype, jsubtype, jdata, jencoding, jsize);
 	env->DeleteGlobalRef(contentClass);
 	return jobj;
 }
@@ -3582,13 +4193,13 @@ JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneInfoMessageImpl_getCont
  * Signature: (JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V
  */
 JNIEXPORT void JNICALL Java_org_linphone_core_LinphoneInfoMessageImpl_setContent(JNIEnv *env, jobject jobj, jlong infoptr, jstring jtype, jstring jsubtype, jstring jdata){
-	LinphoneContent content={0};
+	LinphoneContentPrivate content={0};
 
 	content.type=(char*)env->GetStringUTFChars(jtype,NULL);
 	content.subtype=(char*)env->GetStringUTFChars(jsubtype,NULL);
 	content.data=(void*)env->GetStringUTFChars(jdata,NULL);
 	content.size=strlen((char*)content.data);
-	linphone_info_message_set_content((LinphoneInfoMessage*)infoptr,&content);
+	linphone_info_message_set_content((LinphoneInfoMessage*)infoptr,LINPHONE_CONTENT(&content));
 	env->ReleaseStringUTFChars(jtype,content.type);
 	env->ReleaseStringUTFChars(jsubtype,content.subtype);
 	env->ReleaseStringUTFChars(jdata,(char*)content.data);
@@ -3614,7 +4225,7 @@ JNIEXPORT void JNICALL Java_org_linphone_core_LinphoneInfoMessageImpl_addHeader(
  * Signature: (JLjava/lang/String;)Ljava/lang/String;
  */
 JNIEXPORT jstring JNICALL Java_org_linphone_core_LinphoneInfoMessageImpl_getHeader(JNIEnv *env, jobject jobj, jlong infoptr, jstring jname){
-	const char *name=name=env->GetStringUTFChars(jname,NULL);
+	const char *name=env->GetStringUTFChars(jname,NULL);
 	const char *ret=linphone_info_message_get_header((LinphoneInfoMessage*)infoptr,name);
 	env->ReleaseStringUTFChars(jname,name);
 	return ret ? env->NewStringUTF(ret) : NULL;
@@ -3645,6 +4256,12 @@ JNIEXPORT void JNICALL Java_org_linphone_core_LinphoneCoreFactoryImpl__1setLogHa
 	if (jhandler){
 		handler_obj=env->NewGlobalRef(jhandler);
 	}
+}
+
+JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneEventImpl_getCore(JNIEnv *env, jobject jobj, jlong evptr){
+	LinphoneCore *lc=linphone_event_get_core((LinphoneEvent*)evptr);
+	jobject core = (jobject)linphone_core_get_user_data(lc);
+	return core;
 }
 
 /*
@@ -3684,7 +4301,7 @@ JNIEXPORT jint JNICALL Java_org_linphone_core_LinphoneEventImpl_denySubscription
  * Signature: (JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)I
  */
 JNIEXPORT jint JNICALL Java_org_linphone_core_LinphoneEventImpl_notify(JNIEnv *env, jobject jobj, jlong evptr, jstring jtype, jstring jsubtype, jbyteArray jdata, jstring jencoding){
-	LinphoneContent content={0};
+	LinphoneContentPrivate content={0};
 	LinphoneEvent *ev=(LinphoneEvent*)evptr;
 	jint err;
 
@@ -3696,7 +4313,7 @@ JNIEXPORT jint JNICALL Java_org_linphone_core_LinphoneEventImpl_notify(JNIEnv *e
 		content.size=env->GetArrayLength(jdata);
 	}
 
-	err=linphone_event_notify(ev,content.type ? &content : NULL);
+	err=linphone_event_notify(ev,content.type ? LINPHONE_CONTENT(&content) : NULL);
 
 	if (jtype){
 		env->ReleaseStringUTFChars(jtype,content.type);
@@ -3713,7 +4330,7 @@ JNIEXPORT jint JNICALL Java_org_linphone_core_LinphoneEventImpl_notify(JNIEnv *e
  * Signature: (JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)I
  */
 JNIEXPORT jint JNICALL Java_org_linphone_core_LinphoneEventImpl_updateSubscribe(JNIEnv *env, jobject jobj, jlong evptr, jstring jtype, jstring jsubtype, jbyteArray jdata, jstring jencoding){
-	LinphoneContent content={0};
+	LinphoneContentPrivate content={0};
 	LinphoneEvent *ev=(LinphoneEvent*)evptr;
 	jint err;
 
@@ -3725,7 +4342,7 @@ JNIEXPORT jint JNICALL Java_org_linphone_core_LinphoneEventImpl_updateSubscribe(
 		content.size=env->GetArrayLength(jdata);
 	}
 
-	err=linphone_event_update_subscribe(ev,content.type ? &content : NULL);
+	err=linphone_event_update_subscribe(ev,content.type ? LINPHONE_CONTENT(&content) : NULL);
 
 	if (jtype){
 		env->ReleaseStringUTFChars(jtype,content.type);
@@ -3742,7 +4359,7 @@ JNIEXPORT jint JNICALL Java_org_linphone_core_LinphoneEventImpl_updateSubscribe(
  * Signature: (JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)I
  */
 JNIEXPORT jint JNICALL Java_org_linphone_core_LinphoneEventImpl_updatePublish(JNIEnv *env, jobject jobj, jlong evptr, jstring jtype, jstring jsubtype, jbyteArray jdata, jstring jencoding){
-	LinphoneContent content={0};
+	LinphoneContentPrivate content={0};
 	LinphoneEvent *ev=(LinphoneEvent*)evptr;
 	jint err;
 
@@ -3754,7 +4371,7 @@ JNIEXPORT jint JNICALL Java_org_linphone_core_LinphoneEventImpl_updatePublish(JN
 		content.size=env->GetArrayLength(jdata);
 	}
 
-	err=linphone_event_update_publish(ev,content.type ? &content : NULL);
+	err=linphone_event_update_publish(ev,content.type ? LINPHONE_CONTENT(&content) : NULL);
 
 	if (jtype){
 		env->ReleaseStringUTFChars(jtype,content.type);
@@ -3813,7 +4430,6 @@ JNIEXPORT jint JNICALL Java_org_linphone_core_LinphoneEventImpl_getSubscriptionS
 
 JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneCoreImpl_createSubscribe(JNIEnv *env, jobject thiz, jlong jcore, jlong jaddr, jstring jeventname, jint expires) {
 	LinphoneCore *lc = (LinphoneCore*) jcore;
-	LinphoneCoreData* lcData = (LinphoneCoreData*) linphone_core_get_user_data(lc);
 	LinphoneAddress *addr = (LinphoneAddress*) jaddr;
 	LinphoneEvent *event;
 	jobject jevent = NULL;
@@ -3822,13 +4438,13 @@ JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneCoreImpl_createSubscrib
 	event = linphone_core_create_subscribe(lc, addr, event_name, expires);
 	env->ReleaseStringUTFChars(jeventname, event_name);
 	if (event) {
-		jevent = lcData->getEvent(env, event);
+		jevent = getEvent(env, event);
 	}
 	return jevent;
 }
 
 JNIEXPORT void JNICALL Java_org_linphone_core_LinphoneEventImpl_sendSubscribe(JNIEnv *env, jobject thiz, jlong jevent, jstring jtype, jstring jsubtype, jbyteArray jdata, jstring jencoding) {
-	LinphoneContent content = {0};
+	LinphoneContentPrivate content = {0};
 	if (jtype) {
 		content.type = (char*) env->GetStringUTFChars(jtype, NULL);
 		content.subtype = (char*) env->GetStringUTFChars(jsubtype, NULL);
@@ -3836,7 +4452,7 @@ JNIEXPORT void JNICALL Java_org_linphone_core_LinphoneEventImpl_sendSubscribe(JN
 		content.data = (void*) env->GetByteArrayElements(jdata, NULL);
 		content.size = env->GetArrayLength(jdata);
 	}
-	linphone_event_send_subscribe((LinphoneEvent*) jevent, content.type ? &content : NULL);
+	linphone_event_send_subscribe((LinphoneEvent*) jevent, content.type ? LINPHONE_CONTENT(&content) : NULL);
 	if (jtype) {
 		env->ReleaseStringUTFChars(jtype, content.type);
 		env->ReleaseStringUTFChars(jsubtype, content.subtype);
@@ -3847,7 +4463,6 @@ JNIEXPORT void JNICALL Java_org_linphone_core_LinphoneEventImpl_sendSubscribe(JN
 
 JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneCoreImpl_createPublish(JNIEnv *env, jobject thiz, jlong jcore, jlong jaddr, jstring jeventname, jint expires) {
 	LinphoneCore *lc = (LinphoneCore*) jcore;
-	LinphoneCoreData* lcData = (LinphoneCoreData*) linphone_core_get_user_data(lc);
 	LinphoneAddress *addr = (LinphoneAddress*) jaddr;
 	LinphoneEvent *event;
 	jobject jevent = NULL;
@@ -3856,13 +4471,13 @@ JNIEXPORT jobject JNICALL Java_org_linphone_core_LinphoneCoreImpl_createPublish(
 	event = linphone_core_create_publish(lc, addr, event_name, expires);
 	env->ReleaseStringUTFChars(jeventname, event_name);
 	if (event) {
-		jevent = lcData->getEvent(env, event);
+		jevent = getEvent(env, event);
 	}
 	return jevent;
 }
 
 JNIEXPORT void JNICALL Java_org_linphone_core_LinphoneEventImpl_sendPublish(JNIEnv *env, jobject thiz, jlong jevent, jstring jtype, jstring jsubtype, jbyteArray jdata, jstring jencoding) {
-	LinphoneContent content = {0};
+	LinphoneContentPrivate content = {0};
 	if (jtype) {
 		content.type = (char*) env->GetStringUTFChars(jtype, NULL);
 		content.subtype = (char*) env->GetStringUTFChars(jsubtype, NULL);
@@ -3870,7 +4485,7 @@ JNIEXPORT void JNICALL Java_org_linphone_core_LinphoneEventImpl_sendPublish(JNIE
 		content.data = (void*) env->GetByteArrayElements(jdata, NULL);
 		content.size = env->GetArrayLength(jdata);
 	}
-	linphone_event_send_publish((LinphoneEvent*) jevent, content.type ? &content : NULL);
+	linphone_event_send_publish((LinphoneEvent*) jevent, content.type ? LINPHONE_CONTENT(&content) : NULL);
 	if (jtype) {
 		env->ReleaseStringUTFChars(jtype, content.type);
 		env->ReleaseStringUTFChars(jsubtype, content.subtype);
@@ -4280,6 +4895,7 @@ JNIEXPORT jint JNICALL Java_org_linphone_core_PresenceActivityImpl_setDescriptio
 	const char *cdescription = description ? env->GetStringUTFChars(description, NULL) : NULL;
 	linphone_presence_activity_set_description(activity, cdescription);
 	if (cdescription) env->ReleaseStringUTFChars(description, cdescription);
+	return (jint)0;
 }
 
 /*
@@ -4331,6 +4947,7 @@ JNIEXPORT jint JNICALL Java_org_linphone_core_PresenceServiceImpl_setId(JNIEnv *
 	const char *cid = id ? env->GetStringUTFChars(id, NULL) : NULL;
 	linphone_presence_service_set_id(service, cid);
 	if (cid) env->ReleaseStringUTFChars(id, cid);
+	return (jint)0;
 }
 
 /*
@@ -4376,6 +4993,7 @@ JNIEXPORT jint JNICALL Java_org_linphone_core_PresenceServiceImpl_setContact(JNI
 	const char *ccontact = contact ? env->GetStringUTFChars(contact, NULL) : NULL;
 	linphone_presence_service_set_contact(service, ccontact);
 	if (ccontact) env->ReleaseStringUTFChars(contact, ccontact);
+	return (jint)0;
 }
 
 /*
@@ -4466,6 +5084,7 @@ JNIEXPORT jint JNICALL Java_org_linphone_core_PresencePersonImpl_setId(JNIEnv *e
 	const char *cid = id ? env->GetStringUTFChars(id, NULL) : NULL;
 	linphone_presence_person_set_id(person, cid);
 	if (cid) env->ReleaseStringUTFChars(id, cid);
+	return (jint)0;
 }
 
 /*
@@ -4638,6 +5257,7 @@ JNIEXPORT jint JNICALL Java_org_linphone_core_PresenceNoteImpl_setContent(JNIEnv
 	const char *ccontent = content ? env->GetStringUTFChars(content, NULL) : NULL;
 	linphone_presence_note_set_content(note, ccontent);
 	if (ccontent) env->ReleaseStringUTFChars(content, ccontent);
+	return (jint)0;
 }
 
 /*
@@ -4661,6 +5281,7 @@ JNIEXPORT jint JNICALL Java_org_linphone_core_PresenceNoteImpl_setLang(JNIEnv *e
 	const char *clang = lang ? env->GetStringUTFChars(lang, NULL) : NULL;
 	linphone_presence_note_set_lang(note, clang);
 	if (clang) env->ReleaseStringUTFChars(lang, clang);
+	return (jint)0;
 }
 
 /*
@@ -4769,3 +5390,112 @@ JNIEXPORT jstring JNICALL Java_org_linphone_core_ErrorInfoImpl_getDetails(JNIEnv
 }
 #endif
 
+/* Linphone Player */
+struct LinphonePlayerData {
+	LinphonePlayerData(JNIEnv *env, jobject listener, jobject jLinphonePlayer) :
+		mListener(env->NewGlobalRef(listener)),
+		mJLinphonePlayer(env->NewGlobalRef(jLinphonePlayer))
+	{
+		mListenerClass = (jclass)env->NewGlobalRef(env->GetObjectClass(listener));
+		mEndOfFileMethodID = env->GetMethodID(mListenerClass, "endOfFile", "(Lorg/linphone/core/LinphonePlayer;)V");
+		if(mEndOfFileMethodID == NULL) {
+			ms_error("Could not get endOfFile method ID");
+			env->ExceptionClear();
+		}
+	}
+
+	~LinphonePlayerData() {
+		JNIEnv *env;
+		jvm->AttachCurrentThread(&env, NULL);
+		env->DeleteGlobalRef(mListener);
+		env->DeleteGlobalRef(mListenerClass);
+		env->DeleteGlobalRef(mJLinphonePlayer);
+	}
+
+	jobject mListener;
+	jclass mListenerClass;
+	jobject mJLinphonePlayer;
+	jmethodID mEndOfFileMethodID;
+};
+
+static void _eof_callback(LinphonePlayer *player, void *user_data) {
+	JNIEnv *env;
+	LinphonePlayerData *player_data = (LinphonePlayerData *)user_data;
+	jvm->AttachCurrentThread(&env, NULL);
+	env->CallVoidMethod(player_data->mListener, player_data->mEndOfFileMethodID, player_data->mJLinphonePlayer);
+}
+
+extern "C" jint Java_org_linphone_core_LinphonePlayerImpl_open(JNIEnv *env, jobject jPlayer, jlong ptr, jstring filename, jobject listener) {
+	LinphonePlayerData *data = NULL;
+	LinphonePlayerEofCallback cb = NULL;
+	if(listener) {
+		data = new LinphonePlayerData(env, listener, jPlayer);
+		cb = _eof_callback;
+	}
+	if(linphone_player_open((LinphonePlayer *)ptr, env->GetStringUTFChars(filename, NULL), cb, data) == -1) {
+		if(data) delete data;
+		return -1;
+	}
+	return 0;
+}
+
+extern "C" jint Java_org_linphone_core_LinphonePlayerImpl_start(JNIEnv *env, jobject jobj, jlong ptr) {
+	return (jint)linphone_player_start((LinphonePlayer *)ptr);
+}
+
+extern "C" jint Java_org_linphone_core_LinphonePlayerImpl_pause(JNIEnv *env, jobject jobj, jlong ptr) {
+	return (jint)linphone_player_pause((LinphonePlayer *)ptr);
+}
+
+extern "C" jint Java_org_linphone_core_LinphonePlayerImpl_seek(JNIEnv *env, jobject jobj, jlong ptr, jint timeMs) {
+	return (jint)linphone_player_seek((LinphonePlayer *)ptr, timeMs);
+}
+
+extern "C" jint Java_org_linphone_core_LinphonePlayerImpl_getState(JNIEnv *env, jobject jobj, jlong ptr) {
+	return (jint)linphone_player_get_state((LinphonePlayer *)ptr);
+}
+
+extern "C" jint Java_org_linphone_core_LinphonePlayerImpl_getDuration(JNIEnv *env, jobject jobj, jlong ptr) {
+	return (jint)linphone_player_get_duration((LinphonePlayer *)ptr);
+}
+
+extern "C" jint Java_org_linphone_core_LinphonePlayerImpl_getCurrentPosition(JNIEnv *env, jobject jobj, jlong ptr) {
+	return (jint)linphone_player_get_current_position((LinphonePlayer *)ptr);
+}
+
+extern "C" void Java_org_linphone_core_LinphonePlayerImpl_close(JNIEnv *env, jobject playerPtr, jlong ptr) {
+	LinphonePlayer *player = (LinphonePlayer *)ptr;
+	if(player->user_data) {
+		LinphonePlayerData *data = (LinphonePlayerData *)player->user_data;
+		if(data) delete data;
+		player->user_data = NULL;
+	}
+	linphone_player_close(player);
+}
+
+extern "C" void Java_org_linphone_core_LinphonePlayerImpl_destroy(JNIEnv *env, jobject jobj, jlong playerPtr) {
+	LinphonePlayer *player = (LinphonePlayer *)playerPtr;
+	if(player == NULL) {
+		ms_error("Cannot destroy the LinphonePlayerImpl object. Native pointer is NULL");
+		return;
+	}
+	if(player->user_data) {
+		delete (LinphonePlayerData *)player->user_data;
+	}
+	jobject window_id = (jobject)ms_media_player_get_window_id((MSMediaPlayer *)player->impl);
+	if(window_id) env->DeleteGlobalRef(window_id);
+	linphone_player_destroy(player);
+}
+
+extern "C" jlong Java_org_linphone_core_LinphoneCoreImpl_createLocalPlayer(JNIEnv *env, jobject jobj, jlong ptr, jobject window) {
+	jobject window_ref = NULL;
+	window_ref = env->NewGlobalRef(window);
+	LinphonePlayer *player = linphone_core_create_local_player((LinphoneCore *)ptr, NULL, "MSAndroidDisplay", (unsigned long)window_ref);
+	if(player == NULL) {
+		ms_error("Fails to create a player");
+		if(window_ref) env->DeleteGlobalRef(window_ref);
+		return 0;
+	} else {
+		return (jlong)player;
+	}
+}

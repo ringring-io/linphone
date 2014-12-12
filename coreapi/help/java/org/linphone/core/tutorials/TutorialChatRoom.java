@@ -18,6 +18,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  */
 package org.linphone.core.tutorials;
 
+import java.nio.ByteBuffer;
+
 import org.linphone.core.LinphoneAddress;
 import org.linphone.core.LinphoneCall;
 import org.linphone.core.LinphoneCall.State;
@@ -32,7 +34,7 @@ import org.linphone.core.LinphoneCore.RegistrationState;
 import org.linphone.core.LinphoneCore.RemoteProvisioningState;
 import org.linphone.core.LinphoneCoreException;
 import org.linphone.core.LinphoneCoreFactory;
-import org.linphone.core.LinphoneCoreListener;
+import org.linphone.core.LinphoneCoreListener.LinphoneListener;
 import org.linphone.core.LinphoneEvent;
 import org.linphone.core.LinphoneFriend;
 import org.linphone.core.LinphoneInfoMessage;
@@ -56,7 +58,7 @@ import org.linphone.core.SubscriptionState;
  * @author Guillaume Beraudo
  *
  */
-public class TutorialChatRoom implements LinphoneCoreListener, LinphoneChatMessage.StateListener {
+public class TutorialChatRoom implements LinphoneListener, LinphoneChatMessage.StateListener {
 	private boolean running;
 	private TutorialNotifier TutorialNotifier;
 
@@ -216,6 +218,27 @@ public class TutorialChatRoom implements LinphoneCoreListener, LinphoneChatMessa
 			RemoteProvisioningState state, String message) {
 		// TODO Auto-generated method stub
 		
+	}
+
+	@Override
+	public void fileTransferProgressIndication(LinphoneCore lc,
+			LinphoneChatMessage message, LinphoneContent content, int progress) {
+		// TODO Auto-generated method stub
+		
+	}
+
+	@Override
+	public void fileTransferRecv(LinphoneCore lc, LinphoneChatMessage message,
+			LinphoneContent content, byte[] buffer, int size) {
+		// TODO Auto-generated method stub
+		
+	}
+
+	@Override
+	public int fileTransferSend(LinphoneCore lc, LinphoneChatMessage message,
+			LinphoneContent content, ByteBuffer buffer, int size) {
+		// TODO Auto-generated method stub
+		return 0;
 	}
 
 

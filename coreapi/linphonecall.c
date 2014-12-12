@@ -37,6 +37,11 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "mediastreamer2/mseventqueue.h"
 #include "mediastreamer2/mssndcard.h"
 
+static const char EC_STATE_STORE[] = ".linphone.ecstate";
+static const size_t EC_STATE_MAX_LEN = 1048576; // 1Mo
+
+static void linphone_call_stats_uninit(LinphoneCallStats *stats);
+
 #ifdef VIDEO_ENABLED
 static MSWebCam *get_nowebcam_device(){
 	return ms_web_cam_manager_get_cam(ms_web_cam_manager_get(),"StaticImage: Static picture");
@@ -94,36 +99,69 @@ bool_t linphone_call_get_authentication_token_verified(LinphoneCall *call){
 	return call->auth_token_verified;
 }
 
-static bool_t linphone_call_are_all_streams_encrypted(LinphoneCall *call) {
+static bool_t linphone_call_all_streams_encrypted(const LinphoneCall *call) {
 	int number_of_encrypted_stream = 0;
 	int number_of_active_stream = 0;
 	if (call) {
 		if (call->audiostream && media_stream_get_state((MediaStream *)call->audiostream) == MSStreamStarted) {
 			number_of_active_stream++;
-			if(media_stream_is_secured((MediaStream *)call->audiostream))
+			if(media_stream_secured((MediaStream *)call->audiostream))
 				number_of_encrypted_stream++;
 		}
 		if (call->videostream && media_stream_get_state((MediaStream *)call->videostream) == MSStreamStarted) {
 			number_of_active_stream++;
-			if (media_stream_is_secured((MediaStream *)call->videostream))
+			if (media_stream_secured((MediaStream *)call->videostream))
 				number_of_encrypted_stream++;
 		}
 	}
 	return number_of_active_stream>0 && number_of_active_stream==number_of_encrypted_stream;
 }
 
+static bool_t linphone_call_all_streams_avpf_enabled(const LinphoneCall *call) {
+	int nb_active_streams = 0;
+	int nb_avpf_enabled_streams = 0;
+	if (call) {
+		if (call->audiostream && media_stream_get_state((MediaStream *)call->audiostream) == MSStreamStarted) {
+			nb_active_streams++;
+			if (media_stream_avpf_enabled((MediaStream *)call->audiostream))
+				nb_avpf_enabled_streams++;
+		}
+		if (call->videostream && media_stream_get_state((MediaStream *)call->videostream) == MSStreamStarted) {
+			nb_active_streams++;
+			if (media_stream_avpf_enabled((MediaStream *)call->videostream))
+				nb_avpf_enabled_streams++;
+		}
+	}
+	return ((nb_active_streams > 0) && (nb_active_streams == nb_avpf_enabled_streams));
+}
+
+static uint16_t linphone_call_get_avpf_rr_interval(const LinphoneCall *call) {
+	uint16_t rr_interval = 0;
+	uint16_t stream_rr_interval;
+	if (call) {
+		if (call->audiostream && media_stream_get_state((MediaStream *)call->audiostream) == MSStreamStarted) {
+			stream_rr_interval = media_stream_get_avpf_rr_interval((MediaStream *)call->audiostream);
+			if (stream_rr_interval > rr_interval) rr_interval = stream_rr_interval;
+		}
+		if (call->videostream && media_stream_get_state((MediaStream *)call->videostream) == MSStreamStarted) {
+			stream_rr_interval = media_stream_get_avpf_rr_interval((MediaStream *)call->videostream);
+			if (stream_rr_interval > rr_interval) rr_interval = stream_rr_interval;
+		}
+	} else {
+		rr_interval = 5000;
+	}
+	return rr_interval;
+}
+
 static void propagate_encryption_changed(LinphoneCall *call){
-	LinphoneCore *lc=call->core;
-	if (!linphone_call_are_all_streams_encrypted(call)) {
+	if (!linphone_call_all_streams_encrypted(call)) {
 		ms_message("Some streams are not encrypted");
-		call->current_params.media_encryption=LinphoneMediaEncryptionNone;
-		if (lc->vtable.call_encryption_changed)
-			lc->vtable.call_encryption_changed(call->core, call, FALSE, call->auth_token);
+		call->current_params->media_encryption=LinphoneMediaEncryptionNone;
+		linphone_core_notify_call_encryption_changed(call->core, call, FALSE, call->auth_token);
 	} else {
 		ms_message("All streams are encrypted");
-		call->current_params.media_encryption=LinphoneMediaEncryptionZRTP;
-		if (lc->vtable.call_encryption_changed)
-			lc->vtable.call_encryption_changed(call->core, call, TRUE, call->auth_token);
+		call->current_params->media_encryption=LinphoneMediaEncryptionZRTP;
+		linphone_core_notify_call_encryption_changed(call->core, call, TRUE, call->auth_token);
 	}
 }
 
@@ -133,9 +171,9 @@ static void linphone_call_audiostream_encryption_changed(void *data, bool_t encr
 
 	call = (LinphoneCall *)data;
 
-	if (encrypted && call->core->vtable.display_status != NULL) {
+	if (encrypted) {
 		snprintf(status,sizeof(status)-1,_("Authentication token is %s"),call->auth_token);
-		 call->core->vtable.display_status(call->core, status);
+		linphone_core_notify_display_status(call->core, status);
 	}
 
 	propagate_encryption_changed(call);
@@ -146,7 +184,7 @@ static void linphone_call_audiostream_encryption_changed(void *data, bool_t encr
 	{
 		const LinphoneCallParams *params=linphone_call_get_current_params(call);
 		if (params->has_video) {
-			OrtpZrtpParams params;
+			MSZrtpParams params;
 			ms_message("Trying to enable encryption on video stream");
 			params.zid_file=NULL; //unused
 			video_stream_enable_zrtp(call->videostream,call->audiostream,&params);
@@ -182,9 +220,9 @@ void linphone_call_set_authentication_token_verified(LinphoneCall *call, bool_t 
 		ms_error("linphone_call_set_authentication_token_verified(): No zrtp context.");
 	}
 	if (!call->auth_token_verified && verified){
-		ortp_zrtp_sas_verified(call->audiostream->ms.sessions.zrtp_context);
+		ms_zrtp_sas_verified(call->audiostream->ms.sessions.zrtp_context);
 	}else if (call->auth_token_verified && !verified){
-		ortp_zrtp_sas_reset_verified(call->audiostream->ms.sessions.zrtp_context);
+		ms_zrtp_sas_reset_verified(call->audiostream->ms.sessions.zrtp_context);
 	}
 	call->auth_token_verified=verified;
 	propagate_encryption_changed(call);
@@ -197,8 +235,15 @@ static MSList *make_codec_list(LinphoneCore *lc, const MSList *codecs, int bandw
 	if (max_sample_rate) *max_sample_rate=0;
 	for(it=codecs;it!=NULL;it=it->next){
 		PayloadType *pt=(PayloadType*)it->data;
-		payload_type_unset_flag(pt, PAYLOAD_TYPE_RTCP_FEEDBACK_ENABLED); /* Disable AVPF for the moment. */
 		if (pt->flags & PAYLOAD_TYPE_ENABLED){
+			int sample_rate = payload_type_get_rate(pt);
+
+			if( strcasecmp("G722",pt->mime_type) == 0 ){
+				/* G722 spec says 8000 but the codec actually requires 16000 */
+				ms_debug("Correcting sample rate for G722");
+				sample_rate = 16000;
+			}
+
 			if (bandwidth_limit>0 && !linphone_core_is_payload_type_usable_for_bandwidth(lc,pt,bandwidth_limit)){
 				ms_message("Codec %s/%i eliminated because of audio bandwidth constraint of %i kbit/s",
 					   pt->mime_type,pt->clock_rate,bandwidth_limit);
@@ -207,7 +252,7 @@ static MSList *make_codec_list(LinphoneCore *lc, const MSList *codecs, int bandw
 			if (linphone_core_check_payload_type_usability(lc,pt)){
 				l=ms_list_append(l,payload_type_clone(pt));
 				nb++;
-				if (max_sample_rate && payload_type_get_rate(pt)>*max_sample_rate) *max_sample_rate=payload_type_get_rate(pt);
+				if (max_sample_rate && sample_rate>*max_sample_rate) *max_sample_rate=sample_rate;
 			}
 		}
 		if ((nb_codecs_limit > 0) && (nb >= nb_codecs_limit)) break;
@@ -217,11 +262,12 @@ static MSList *make_codec_list(LinphoneCore *lc, const MSList *codecs, int bandw
 
 static void update_media_description_from_stun(SalMediaDescription *md, const StunCandidate *ac, const StunCandidate *vc){
 	int i;
-	for (i = 0; i < md->n_active_streams; i++) {
+	for (i = 0; i < md->nb_streams; i++) {
+		if (!sal_stream_description_active(&md->streams[i])) continue;
 		if ((md->streams[i].type == SalAudio) && (ac->port != 0)) {
 			strcpy(md->streams[0].rtp_addr,ac->addr);
 			md->streams[0].rtp_port=ac->port;
-			if ((ac->addr[0]!='\0' && vc->addr[0]!='\0' && strcmp(ac->addr,vc->addr)==0) || md->n_active_streams==1){
+			if ((ac->addr[0]!='\0' && vc->addr[0]!='\0' && strcmp(ac->addr,vc->addr)==0) || sal_media_description_get_nb_active_streams(md)==1){
 				strcpy(md->addr,ac->addr);
 			}
 		}
@@ -264,9 +310,10 @@ static void setup_encryption_keys(LinphoneCall *call, SalMediaDescription *md){
 	SalMediaDescription *old_md=call->localdesc;
 	bool_t keep_srtp_keys=lp_config_get_int(lc->config,"sip","keep_srtp_keys",1);
 
-	for(i=0; i<md->n_active_streams; i++) {
-		if (md->streams[i].proto == SalProtoRtpSavp) {
-			if (keep_srtp_keys && old_md && old_md->streams[i].proto==SalProtoRtpSavp){
+	for(i=0; i<md->nb_streams; i++) {
+		if (!sal_stream_description_active(&md->streams[i])) continue;
+		if (sal_stream_description_has_srtp(&md->streams[i]) == TRUE) {
+			if (keep_srtp_keys && old_md && (sal_stream_description_active(&old_md->streams[i]) == TRUE) && (sal_stream_description_has_srtp(&old_md->streams[i]) == TRUE)) {
 				int j;
 				ms_message("Keeping same crypto keys.");
 				for(j=0;j<SAL_CRYPTO_ALGO_MAX;++j){
@@ -282,28 +329,70 @@ static void setup_encryption_keys(LinphoneCall *call, SalMediaDescription *md){
 	}
 }
 
+static void setup_rtcp_fb(LinphoneCall *call, SalMediaDescription *md) {
+	MSList *pt_it;
+	PayloadType *pt;
+	PayloadTypeAvpfParams avpf_params;
+	int i;
+
+	for (i = 0; i < md->nb_streams; i++) {
+		if (!sal_stream_description_active(&md->streams[i])) continue;
+		for (pt_it = md->streams[i].payloads; pt_it != NULL; pt_it = pt_it->next) {
+			pt = (PayloadType *)pt_it->data;
+			if (call->params->avpf_enabled == TRUE) {
+				payload_type_set_flag(pt, PAYLOAD_TYPE_RTCP_FEEDBACK_ENABLED);
+				avpf_params = payload_type_get_avpf_params(pt);
+				avpf_params.trr_interval = call->params->avpf_rr_interval;
+			} else {
+				payload_type_unset_flag(pt, PAYLOAD_TYPE_RTCP_FEEDBACK_ENABLED);
+				memset(&avpf_params, 0, sizeof(avpf_params));
+			}
+			payload_type_set_avpf_params(pt, avpf_params);
+		}
+	}
+}
+
 static void setup_rtcp_xr(LinphoneCall *call, SalMediaDescription *md) {
 	LinphoneCore *lc = call->core;
 	int i;
 
-	md->rtcp_xr.enabled = lp_config_get_int(lc->config, "rtp", "rtcp_xr_enabled", 0);
+	md->rtcp_xr.enabled = lp_config_get_int(lc->config, "rtp", "rtcp_xr_enabled", 1);
 	if (md->rtcp_xr.enabled == TRUE) {
-		const char *rcvr_rtt_mode = lp_config_get_string(lc->config, "rtp", "rtcp_xr_rcvr_rtt_mode", "none");
+		const char *rcvr_rtt_mode = lp_config_get_string(lc->config, "rtp", "rtcp_xr_rcvr_rtt_mode", "all");
 		if (strcasecmp(rcvr_rtt_mode, "all") == 0) md->rtcp_xr.rcvr_rtt_mode = OrtpRtcpXrRcvrRttAll;
 		else if (strcasecmp(rcvr_rtt_mode, "sender") == 0) md->rtcp_xr.rcvr_rtt_mode = OrtpRtcpXrRcvrRttSender;
 		else md->rtcp_xr.rcvr_rtt_mode = OrtpRtcpXrRcvrRttNone;
 		if (md->rtcp_xr.rcvr_rtt_mode != OrtpRtcpXrRcvrRttNone) {
-			md->rtcp_xr.rcvr_rtt_max_size = lp_config_get_int(lc->config, "rtp", "rtcp_xr_rcvr_rtt_max_size", 0);
+			md->rtcp_xr.rcvr_rtt_max_size = lp_config_get_int(lc->config, "rtp", "rtcp_xr_rcvr_rtt_max_size", 10000);
 		}
-		md->rtcp_xr.stat_summary_enabled = lp_config_get_int(lc->config, "rtp", "rtcp_xr_stat_summary_enabled", 0);
+		md->rtcp_xr.stat_summary_enabled = lp_config_get_int(lc->config, "rtp", "rtcp_xr_stat_summary_enabled", 1);
 		if (md->rtcp_xr.stat_summary_enabled == TRUE) {
 			md->rtcp_xr.stat_summary_flags = OrtpRtcpXrStatSummaryLoss | OrtpRtcpXrStatSummaryDup | OrtpRtcpXrStatSummaryJitt | OrtpRtcpXrStatSummaryTTL;
 		}
-		md->rtcp_xr.voip_metrics_enabled = lp_config_get_int(lc->config, "rtp", "rtcp_xr_voip_metrics_enabled", 0);
+		md->rtcp_xr.voip_metrics_enabled = lp_config_get_int(lc->config, "rtp", "rtcp_xr_voip_metrics_enabled", 1);
 	}
-	for (i = 0; i < md->n_active_streams; i++) {
+	for (i = 0; i < md->nb_streams; i++) {
+		if (!sal_stream_description_active(&md->streams[i])) continue;
 		memcpy(&md->streams[i].rtcp_xr, &md->rtcp_xr, sizeof(md->streams[i].rtcp_xr));
 	}
+}
+
+void linphone_call_increment_local_media_description(LinphoneCall *call){
+	SalMediaDescription *md=call->localdesc;
+	md->session_ver++;
+}
+
+void linphone_call_update_local_media_description_from_ice_or_upnp(LinphoneCall *call){
+	if (call->ice_session != NULL) {
+		_update_local_media_description_from_ice(call->localdesc, call->ice_session);
+		linphone_core_update_ice_state_in_call_stats(call);
+	}
+#ifdef BUILD_UPNP
+	if(call->upnp_session != NULL) {
+		linphone_core_update_local_media_description_from_upnp(call->localdesc, call->upnp_session);
+		linphone_core_update_upnp_state_in_call_stats(call);
+	}
+#endif  //BUILD_UPNP
 }
 
 void linphone_call_make_local_media_description(LinphoneCore *lc, LinphoneCall *call){
@@ -311,13 +400,14 @@ void linphone_call_make_local_media_description(LinphoneCore *lc, LinphoneCall *
 	PayloadType *pt;
 	SalMediaDescription *old_md=call->localdesc;
 	int i;
+	int nb_active_streams = 0;
 	const char *me;
 	SalMediaDescription *md=sal_media_description_new();
 	LinphoneAddress *addr;
 	char* local_ip=call->localip;
-	const char *subject=linphone_call_params_get_session_name(&call->params);
+	const char *subject=linphone_call_params_get_session_name(call->params);
 
-	linphone_core_adapt_to_network(lc,call->ping_time,&call->params);
+	linphone_core_adapt_to_network(lc,call->ping_time,call->params);
 
 	if (call->dest_proxy)
 		me=linphone_proxy_config_get_identity(call->dest_proxy);
@@ -327,50 +417,52 @@ void linphone_call_make_local_media_description(LinphoneCore *lc, LinphoneCall *
 
 	md->session_id=(old_md ? old_md->session_id : (rand() & 0xfff));
 	md->session_ver=(old_md ? (old_md->session_ver+1) : (rand() & 0xfff));
-	md->n_total_streams=(call->biggestdesc ? call->biggestdesc->n_total_streams : 1);
+	md->nb_streams=(call->biggestdesc ? call->biggestdesc->nb_streams : 1);
 
 	strncpy(md->addr,local_ip,sizeof(md->addr));
 	strncpy(md->username,linphone_address_get_username(addr),sizeof(md->username));
 	if (subject) strncpy(md->name,subject,sizeof(md->name));
 
-	if (call->params.down_bw)
-		md->bandwidth=call->params.down_bw;
+	if (call->params->down_bw)
+		md->bandwidth=call->params->down_bw;
 	else md->bandwidth=linphone_core_get_download_bandwidth(lc);
 
 	/*set audio capabilities */
-	md->n_active_streams=1;
 	strncpy(md->streams[0].rtp_addr,local_ip,sizeof(md->streams[0].rtp_addr));
 	strncpy(md->streams[0].rtcp_addr,local_ip,sizeof(md->streams[0].rtcp_addr));
 	strncpy(md->streams[0].name,"Audio",sizeof(md->streams[0].name)-1);
 	md->streams[0].rtp_port=call->media_ports[0].rtp_port;
 	md->streams[0].rtcp_port=call->media_ports[0].rtcp_port;
-	md->streams[0].proto=(call->params.media_encryption == LinphoneMediaEncryptionSRTP) ?
-		SalProtoRtpSavp : SalProtoRtpAvp;
+	md->streams[0].proto=get_proto_from_call_params(call->params);
 	md->streams[0].type=SalAudio;
-	if (call->params.down_ptime)
-		md->streams[0].ptime=call->params.down_ptime;
+	if (call->params->down_ptime)
+		md->streams[0].ptime=call->params->down_ptime;
 	else
 		md->streams[0].ptime=linphone_core_get_download_ptime(lc);
-	l=make_codec_list(lc,lc->codecs_conf.audio_codecs,call->params.audio_bw,&md->streams[0].max_rate,-1);
+	l=make_codec_list(lc,lc->codecs_conf.audio_codecs,call->params->audio_bw,&md->streams[0].max_rate,-1);
 	pt=payload_type_clone(rtp_profile_get_payload_from_mime(lc->default_profile,"telephone-event"));
 	l=ms_list_append(l,pt);
 	md->streams[0].payloads=l;
+	nb_active_streams++;
 
-	if (call->params.has_video){
-		md->n_active_streams++;
-		strncpy(md->streams[0].name,"Video",sizeof(md->streams[0].name)-1);
+	if (call->params->has_video){
+		strncpy(md->streams[1].rtp_addr,local_ip,sizeof(md->streams[1].rtp_addr));
+		strncpy(md->streams[1].rtcp_addr,local_ip,sizeof(md->streams[1].rtcp_addr));
+		strncpy(md->streams[1].name,"Video",sizeof(md->streams[1].name)-1);
 		md->streams[1].rtp_port=call->media_ports[1].rtp_port;
 		md->streams[1].rtcp_port=call->media_ports[1].rtcp_port;
 		md->streams[1].proto=md->streams[0].proto;
 		md->streams[1].type=SalVideo;
 		l=make_codec_list(lc,lc->codecs_conf.video_codecs,0,NULL,-1);
 		md->streams[1].payloads=l;
+		nb_active_streams++;
 	}
-	if (md->n_total_streams < md->n_active_streams)
-		md->n_total_streams = md->n_active_streams;
+
+	if (md->nb_streams < nb_active_streams)
+		md->nb_streams = nb_active_streams;
 
 	/* Deactivate inactive streams. */
-	for (i = md->n_active_streams; i < md->n_total_streams; i++) {
+	for (i = nb_active_streams; i < md->nb_streams; i++) {
 		md->streams[i].rtp_port = 0;
 		md->streams[i].rtcp_port = 0;
 		md->streams[i].proto = call->biggestdesc->streams[i].proto;
@@ -381,21 +473,13 @@ void linphone_call_make_local_media_description(LinphoneCore *lc, LinphoneCall *
 	}
 
 	setup_encryption_keys(call,md);
+	setup_rtcp_fb(call, md);
 	setup_rtcp_xr(call, md);
 
 	update_media_description_from_stun(md,&call->ac,&call->vc);
-	if (call->ice_session != NULL) {
-		linphone_core_update_local_media_description_from_ice(md, call->ice_session);
-		linphone_core_update_ice_state_in_call_stats(call);
-	}
-#ifdef BUILD_UPNP
-	if(call->upnp_session != NULL) {
-		linphone_core_update_local_media_description_from_upnp(md, call->upnp_session);
-		linphone_core_update_upnp_state_in_call_stats(call);
-	}
-#endif  //BUILD_UPNP
-	linphone_address_destroy(addr);
 	call->localdesc=md;
+	linphone_call_update_local_media_description_from_ice_or_upnp(call);
+	linphone_address_destroy(addr);
 	if (old_md){
 		call->localdesc_changed=sal_media_description_equals(md,old_md);
 		sal_media_description_unref(old_md);
@@ -482,16 +566,13 @@ static void port_config_set(LinphoneCall *call, int stream_index, int min_port, 
 
 static void linphone_call_init_common(LinphoneCall *call, LinphoneAddress *from, LinphoneAddress *to){
 	int min_port, max_port;
-
-	call->magic=linphone_call_magic;
-	call->refcnt=1;
+	ms_message("New LinphoneCall [%p] initialized (LinphoneCore version: %s)",call,linphone_core_get_version());
 	call->state=LinphoneCallIdle;
 	call->transfer_state = LinphoneCallIdle;
-	call->media_start_time=0;
-	call->log=linphone_call_log_new(call, from, to);
-	call->owns_call_log=TRUE;
+	call->log=linphone_call_log_new(call->dir, from, to);
 	call->camera_enabled=TRUE;
-	call->current_params.media_encryption=LinphoneMediaEncryptionNone;
+	call->current_params = linphone_call_params_new();
+	call->current_params->media_encryption=LinphoneMediaEncryptionNone;
 
 	linphone_core_get_audio_port_range(call->core, &min_port, &max_port);
 	port_config_set(call,0,min_port,max_port);
@@ -533,11 +614,11 @@ void linphone_call_create_op(LinphoneCall *call){
 	if (call->op) sal_op_release(call->op);
 	call->op=sal_op_new(call->core->sal);
 	sal_op_set_user_pointer(call->op,call);
-	if (call->params.referer)
-		sal_call_set_referer(call->op,call->params.referer->op);
-	linphone_configure_op(call->core,call->op,call->log->to,call->params.custom_headers,FALSE);
-	if (call->params.privacy != LinphonePrivacyDefault)
-		sal_op_set_privacy(call->op,(SalPrivacyMask)call->params.privacy);
+	if (call->params->referer)
+		sal_call_set_referer(call->op,call->params->referer->op);
+	linphone_configure_op(call->core,call->op,call->log->to,call->params->custom_headers,FALSE);
+	if (call->params->privacy != LinphonePrivacyDefault)
+		sal_op_set_privacy(call->op,(SalPrivacyMask)call->params->privacy);
 	/*else privacy might be set by proxy */
 }
 
@@ -560,21 +641,70 @@ static void linphone_call_outgoing_select_ip_version(LinphoneCall *call, Linphon
 	}else call->af=AF_INET;
 }
 
+/**
+ * Fill the local ip that routes to the internet according to the destination, or guess it by other special means (upnp).
+ */
+static void linphone_call_get_local_ip(LinphoneCall *call, const LinphoneAddress *remote_addr){
+	const char *ip;
+	int af = call->af;
+	const char *dest = NULL;
+	if (call->dest_proxy == NULL) {
+		struct addrinfo hints;
+		struct addrinfo *res = NULL;
+		int err;
+		const char *domain = linphone_address_get_domain(remote_addr);
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_DGRAM;
+		hints.ai_flags = AI_NUMERICHOST;
+		err = getaddrinfo(domain, NULL, &hints, &res);
+		if (err == 0) {
+			dest = domain;
+		}
+		if (res != NULL) freeaddrinfo(res);
+	}
+	if (_linphone_core_get_firewall_policy(call->core)==LinphonePolicyUseNatAddress
+		&& (ip=linphone_core_get_nat_address_resolved(call->core))!=NULL){
+		strncpy(call->localip,ip,LINPHONE_IPADDR_SIZE);
+		return;
+	}
+#ifdef BUILD_UPNP
+	else if (call->core->upnp != NULL && linphone_core_get_firewall_policy(call->core)==LinphonePolicyUseUpnp &&
+			linphone_upnp_context_get_state(call->core->upnp) == LinphoneUpnpStateOk) {
+		ip = linphone_upnp_context_get_external_ipaddress(call->core->upnp);
+		strncpy(call->localip,ip,LINPHONE_IPADDR_SIZE);
+		return;
+	}
+#endif //BUILD_UPNP
+	linphone_core_get_local_ip(call->core, af, dest, call->localip);
+}
+
+static void linphone_call_destroy(LinphoneCall *obj);
+
+BELLE_SIP_DECLARE_NO_IMPLEMENTED_INTERFACES(LinphoneCall);
+
+BELLE_SIP_INSTANCIATE_VPTR(LinphoneCall, belle_sip_object_t,
+	(belle_sip_object_destroy_t)linphone_call_destroy,
+	NULL, // clone
+	NULL, // marshal
+	FALSE
+);
+
 LinphoneCall * linphone_call_new_outgoing(struct _LinphoneCore *lc, LinphoneAddress *from, LinphoneAddress *to, const LinphoneCallParams *params, LinphoneProxyConfig *cfg){
-	LinphoneCall *call=ms_new0(LinphoneCall,1);
+	LinphoneCall *call = belle_sip_object_new(LinphoneCall);
 
 	call->dir=LinphoneCallOutgoing;
 	call->core=lc;
 	linphone_call_outgoing_select_ip_version(call,to,cfg);
-	linphone_core_get_local_ip(lc,call->af,call->localip);
+	linphone_call_get_local_ip(call, to);
 	linphone_call_init_common(call,from,to);
-	_linphone_call_params_copy(&call->params,params);
+	call->params = linphone_call_params_copy(params);
 
-	if (linphone_core_get_firewall_policy(call->core) == LinphonePolicyUseIce) {
+	if (_linphone_core_get_firewall_policy(call->core) == LinphonePolicyUseIce) {
 		call->ice_session = ice_session_new();
 		ice_session_set_role(call->ice_session, IR_Controlling);
 	}
-	if (linphone_core_get_firewall_policy(call->core) == LinphonePolicyUseStun) {
+	if (_linphone_core_get_firewall_policy(call->core) == LinphonePolicyUseStun) {
 		call->ping_time=linphone_core_run_stun_tests(call->core,call);
 	}
 #ifdef BUILD_UPNP
@@ -600,9 +730,28 @@ static void linphone_call_incoming_select_ip_version(LinphoneCall *call){
 	}else call->af=AF_INET;
 }
 
+/**
+ * Fix call parameters on incoming call to eg. enable AVPF if the incoming call propose it and it is not enabled locally.
+ */
+void linphone_call_set_compatible_incoming_call_parameters(LinphoneCall *call, const SalMediaDescription *md) {
+	call->params->has_video &= linphone_core_media_description_contains_video_stream(md);
+
+	/* Handle AVPF and SRTP. */
+	call->params->avpf_enabled = sal_media_description_has_avpf(md);
+	if (call->params->avpf_enabled == TRUE) {
+		if (call->dest_proxy != NULL) {
+			call->params->avpf_rr_interval = linphone_proxy_config_get_avpf_rr_interval(call->dest_proxy) * 1000;
+		} else {
+			call->params->avpf_rr_interval = linphone_core_get_avpf_rr_interval(call->core)*1000;
+		}
+	}
+	if ((sal_media_description_has_srtp(md) == TRUE) && (media_stream_srtp_supported() == TRUE)) {
+		call->params->media_encryption = LinphoneMediaEncryptionSRTP;
+	}
+}
+
 LinphoneCall * linphone_call_new_incoming(LinphoneCore *lc, LinphoneAddress *from, LinphoneAddress *to, SalOp *op){
-	LinphoneCall *call=ms_new0(LinphoneCall,1);
-	char *from_str;
+	LinphoneCall *call = belle_sip_object_new(LinphoneCall);
 	const SalMediaDescription *md;
 	LinphoneFirewallPolicy fpol;
 
@@ -622,35 +771,39 @@ LinphoneCall * linphone_call_new_incoming(LinphoneCore *lc, LinphoneAddress *fro
 			/*the following sends an option request back to the caller so that
 			 we get a chance to discover our nat'd address before answering.*/
 			call->ping_op=sal_op_new(lc->sal);
-			from_str=linphone_address_as_string_uri_only(from);
+
+			linphone_configure_op(lc, call->ping_op, from, NULL, FALSE);
+
 			sal_op_set_route(call->ping_op,sal_op_get_network_origin(op));
 			sal_op_set_user_pointer(call->ping_op,call);
-			sal_ping(call->ping_op,linphone_core_find_best_identity(lc,from),from_str);
-			ms_free(from_str);
+
+			sal_ping(call->ping_op,sal_op_get_from(call->ping_op), sal_op_get_to(call->ping_op));
 		}
 	}
 
 	linphone_address_clean(from);
-	linphone_core_get_local_ip(lc,call->af,call->localip);
+	linphone_call_get_local_ip(call, from);
 	linphone_call_init_common(call, from, to);
+	call->params = linphone_call_params_new();
 	call->log->call_id=ms_strdup(sal_op_get_call_id(op)); /*must be known at that time*/
-	linphone_core_init_default_params(lc, &call->params);
+	call->dest_proxy = linphone_core_lookup_known_proxy(call->core, to);
+	linphone_core_init_default_params(lc, call->params);
 
 	/*
 	 * Initialize call parameters according to incoming call parameters. This is to avoid to ask later (during reINVITEs) for features that the remote
 	 * end apparently does not support. This features are: privacy, video
 	 */
 	/*set privacy*/
-	call->current_params.privacy=(LinphonePrivacyMask)sal_op_get_privacy(call->op);
+	call->current_params->privacy=(LinphonePrivacyMask)sal_op_get_privacy(call->op);
 	/*set video support */
 	md=sal_call_get_remote_media_description(op);
-	call->params.has_video = !!lc->video_policy.automatically_accept;
+	call->params->has_video = linphone_core_video_enabled(lc) && lc->video_policy.automatically_accept;
 	if (md) {
 		// It is licit to receive an INVITE without SDP
 		// In this case WE chose the media parameters according to policy.
-		call->params.has_video &= linphone_core_media_description_contains_video_stream(md);
+		linphone_call_set_compatible_incoming_call_parameters(call, md);
 	}
-	fpol=linphone_core_get_firewall_policy(call->core);
+	fpol=_linphone_core_get_firewall_policy(call->core);
 	/*create the ice session now if ICE is required*/
 	if (fpol==LinphonePolicyUseIce){
 		if (md){
@@ -692,7 +845,50 @@ LinphoneCall * linphone_call_new_incoming(LinphoneCore *lc, LinphoneAddress *fro
 	return call;
 }
 
-/* this function is called internally to get rid of a call.
+/*
+ * Frees the media resources of the call.
+ * This has to be done at the earliest, unlike signaling resources that sometimes need to be kept a bit more longer.
+ * It is called by linphone_call_set_terminated() (for termination of calls signaled to the application), or directly by the destructor of LinphoneCall
+ * (_linphone_call_destroy) if the call was never notified to the application.
+ */
+void linphone_call_free_media_resources(LinphoneCall *call){
+	linphone_call_stop_media_streams(call);
+	ms_media_stream_sessions_uninit(&call->sessions[0]);
+	ms_media_stream_sessions_uninit(&call->sessions[1]);
+	linphone_call_delete_upnp_session(call);
+	linphone_call_delete_ice_session(call);
+	linphone_call_stats_uninit(&call->stats[0]);
+	linphone_call_stats_uninit(&call->stats[1]);
+}
+
+/*
+ * Called internally when reaching the Released state, to perform cleanups to break circular references.
+**/
+static void linphone_call_set_released(LinphoneCall *call){
+	if (call->op!=NULL) {
+		/*transfer the last error so that it can be obtained even in Released state*/
+		if (call->non_op_error.reason==SalReasonNone){
+			const SalErrorInfo *ei=sal_op_get_error_info(call->op);
+			sal_error_info_set(&call->non_op_error,ei->reason,ei->protocol_code,ei->status_string,ei->warnings);
+		}
+		/* so that we cannot have anymore upcalls for SAL
+			concerning this call*/
+		sal_op_release(call->op);
+		call->op=NULL;
+	}
+	/*it is necessary to reset pointers to other call to prevent circular references that would result in memory never freed.*/
+	if (call->referer){
+		linphone_call_unref(call->referer);
+		call->referer=NULL;
+	}
+	if (call->transfer_target){
+		linphone_call_unref(call->transfer_target);
+		call->transfer_target=NULL;
+	}
+	linphone_call_unref(call);
+}
+
+/* this function is called internally to get rid of a call that was notified to the application, because it reached the end or error state.
  It performs the following tasks:
  - remove the call from the internal list of calls
  - update the call logs accordingly
@@ -701,16 +897,8 @@ LinphoneCall * linphone_call_new_incoming(LinphoneCore *lc, LinphoneAddress *fro
 static void linphone_call_set_terminated(LinphoneCall *call){
 	LinphoneCore *lc=call->core;
 
-	linphone_call_stop_media_streams(call);
-	ms_media_stream_sessions_uninit(&call->sessions[0]);
-	ms_media_stream_sessions_uninit(&call->sessions[1]);
-	linphone_call_delete_upnp_session(call);
-	linphone_call_delete_ice_session(call);
-	linphone_core_update_allocated_audio_bandwidth(lc);
-
-	call->owns_call_log=FALSE;
+	linphone_call_free_media_resources(call);
 	linphone_call_log_completed(call);
-
 
 	if (call == lc->current_call){
 		ms_message("Resetting the current call");
@@ -720,7 +908,6 @@ static void linphone_call_set_terminated(LinphoneCall *call){
 	if (linphone_core_del_call(lc,call) != 0){
 		ms_error("Could not remove the call from the list !!!");
 	}
-
 	linphone_core_conference_check_uninit(lc);
 	if (call->ringing_beep){
 		linphone_core_stop_dtmf(lc);
@@ -729,9 +916,10 @@ static void linphone_call_set_terminated(LinphoneCall *call){
 }
 
 void linphone_call_fix_call_parameters(LinphoneCall *call){
-	call->params.has_video=call->current_params.has_video;
-	if (call->params.media_encryption != LinphoneMediaEncryptionZRTP) /*in case of ZRTP call parameter are handle after zrtp negociation*/
-		call->params.media_encryption=call->current_params.media_encryption;
+	call->params->has_video=call->current_params->has_video;
+
+	if (call->params->media_encryption != LinphoneMediaEncryptionZRTP) /*in case of ZRTP call parameter are handle after zrtp negociation*/
+		call->params->media_encryption=call->current_params->media_encryption;
 }
 
 const char *linphone_call_state_to_string(LinphoneCallState cs){
@@ -774,6 +962,10 @@ const char *linphone_call_state_to_string(LinphoneCallState cs){
 			return "LinphoneCallUpdating";
 		case LinphoneCallReleased:
 			return "LinphoneCallReleased";
+		case LinphoneCallEarlyUpdatedByRemote:
+			return "LinphoneCallEarlyUpdatedByRemote";
+		case LinphoneCallEarlyUpdating:
+			return "LinphoneCallEarlyUpdating";
 	}
 	return "undefined state";
 }
@@ -814,50 +1006,28 @@ void linphone_call_set_state(LinphoneCall *call, LinphoneCallState cstate, const
 		}
 		if (cstate == LinphoneCallConnected) {
 			call->log->status=LinphoneCallSuccess;
-			call->media_start_time=time(NULL);
+			call->log->connected_date_time=time(NULL);
 		}
 
-		if (cstate == LinphoneCallStreamsRunning) {
-			linphone_reporting_update_ip(call);
+		linphone_core_notify_call_state_changed(lc,call,cstate,message);
+		linphone_reporting_call_state_updated(call);
+		
+		/*cancelling DTMF sequence, if any*/
+		if (cstate!=LinphoneCallStreamsRunning && call->dtmfs_timer!=NULL){
+			linphone_call_cancel_dtmfs(call);
 		}
-
-		if (lc->vtable.call_state_changed)
-			lc->vtable.call_state_changed(lc,call,cstate,message);
-
-		if (cstate==LinphoneCallEnd){
-			if (call->log->status == LinphoneCallSuccess)
-				linphone_reporting_publish(call);
-		}
-
 		if (cstate==LinphoneCallReleased){
-			if (call->op!=NULL) {
-				/*transfer the last error so that it can be obtained even in Released state*/
-				if (call->non_op_error.reason==SalReasonNone){
-					const SalErrorInfo *ei=sal_op_get_error_info(call->op);
-					sal_error_info_set(&call->non_op_error,ei->reason,ei->protocol_code,ei->status_string,ei->warnings);
-				}
-				/* so that we cannot have anymore upcalls for SAL
-				 concerning this call*/
-				sal_op_release(call->op);
-				call->op=NULL;
-			}
-			/*it is necessary to reset pointers to other call to prevent circular references that would result in memory never freed.*/
-			if (call->referer){
-				linphone_call_unref(call->referer);
-				call->referer=NULL;
-			}
-			if (call->transfer_target){
-				linphone_call_unref(call->transfer_target);
-				call->transfer_target=NULL;
-			}
-			linphone_call_unref(call);
+			linphone_call_set_released(call);
 		}
+		linphone_core_soundcard_hint_check(lc);
 	}
 }
 
-static void linphone_call_destroy(LinphoneCall *obj)
-{
+static void linphone_call_destroy(LinphoneCall *obj){
 	ms_message("Call [%p] freed.",obj);
+	if (obj->audiostream || obj->videostream){
+		linphone_call_free_media_resources(obj);
+	}
 	if (obj->op!=NULL) {
 		sal_op_release(obj->op);
 		obj->op=NULL;
@@ -876,9 +1046,11 @@ static void linphone_call_destroy(LinphoneCall *obj)
 	}
 	if (obj->ping_op) {
 		sal_op_release(obj->ping_op);
+		obj->ping_op=NULL;
 	}
 	if (obj->refer_to){
 		ms_free(obj->refer_to);
+		obj->refer_to=NULL;
 	}
 	if (obj->referer){
 		linphone_call_unref(obj->referer);
@@ -886,16 +1058,32 @@ static void linphone_call_destroy(LinphoneCall *obj)
 	}
 	if (obj->transfer_target){
 		linphone_call_unref(obj->transfer_target);
+		obj->transfer_target=NULL;
 	}
-	if (obj->owns_call_log)
-		linphone_call_log_destroy(obj->log);
+	if (obj->log) {
+		linphone_call_log_unref(obj->log);
+		obj->log=NULL;
+	}
 	if (obj->auth_token) {
 		ms_free(obj->auth_token);
+		obj->auth_token=NULL;
 	}
-	linphone_call_params_uninit(&obj->params);
-	linphone_call_params_uninit(&obj->current_params);
+	if (obj->dtmfs_timer) {
+		linphone_call_cancel_dtmfs(obj);
+	}
+	if (obj->params){
+		linphone_call_params_unref(obj->params);
+		obj->params=NULL;
+	}
+	if (obj->current_params){
+		linphone_call_params_unref(obj->current_params);
+		obj->current_params=NULL;
+	}
+	if (obj->remote_params != NULL) {
+		linphone_call_params_unref(obj->remote_params);
+		obj->remote_params=NULL;
+	}
 	sal_error_info_reset(&obj->non_op_error);
-	ms_free(obj);
 }
 
 /**
@@ -903,27 +1091,13 @@ static void linphone_call_destroy(LinphoneCall *obj)
  * @{
 **/
 
-/**
- * Increments the call 's reference count.
- * An application that wishes to retain a pointer to call object
- * must use this function to unsure the pointer remains
- * valid. Once the application no more needs this pointer,
- * it must call linphone_call_unref().
-**/
 LinphoneCall * linphone_call_ref(LinphoneCall *obj){
-	obj->refcnt++;
+	belle_sip_object_ref(obj);
 	return obj;
 }
 
-/**
- * Decrements the call object reference count.
- * See linphone_call_ref().
-**/
 void linphone_call_unref(LinphoneCall *obj){
-	obj->refcnt--;
-	if (obj->refcnt==0){
-		linphone_call_destroy(obj);
-	}
+	belle_sip_object_unref(obj);
 }
 
 /**
@@ -933,31 +1107,35 @@ const LinphoneCallParams * linphone_call_get_current_params(LinphoneCall *call){
 #ifdef VIDEO_ENABLED
 	VideoStream *vstream;
 #endif
-	MS_VIDEO_SIZE_ASSIGN(call->current_params.sent_vsize, UNKNOWN);
-	MS_VIDEO_SIZE_ASSIGN(call->current_params.recv_vsize, UNKNOWN);
+	MS_VIDEO_SIZE_ASSIGN(call->current_params->sent_vsize, UNKNOWN);
+	MS_VIDEO_SIZE_ASSIGN(call->current_params->recv_vsize, UNKNOWN);
 #ifdef VIDEO_ENABLED
 	vstream = call->videostream;
 	if (vstream != NULL) {
-		call->current_params.sent_vsize = video_stream_get_sent_video_size(vstream);
-		call->current_params.recv_vsize = video_stream_get_received_video_size(vstream);
+		call->current_params->sent_vsize = video_stream_get_sent_video_size(vstream);
+		call->current_params->recv_vsize = video_stream_get_received_video_size(vstream);
+		call->current_params->sent_fps = video_stream_get_sent_framerate(vstream);
+		call->current_params->received_fps = video_stream_get_received_framerate(vstream);
 	}
 #endif
 
-	if (linphone_call_are_all_streams_encrypted(call)) {
+	if (linphone_call_all_streams_encrypted(call)) {
 		 if (linphone_call_get_authentication_token(call)) {
-			 call->current_params.media_encryption=LinphoneMediaEncryptionZRTP;
+			 call->current_params->media_encryption=LinphoneMediaEncryptionZRTP;
 		 } else {
-			 call->current_params.media_encryption=LinphoneMediaEncryptionSRTP;
+			 call->current_params->media_encryption=LinphoneMediaEncryptionSRTP;
 		 }
 	} else {
-		call->current_params.media_encryption=LinphoneMediaEncryptionNone;
+		call->current_params->media_encryption=LinphoneMediaEncryptionNone;
+	}
+	call->current_params->avpf_enabled = linphone_call_all_streams_avpf_enabled(call);
+	if (call->current_params->avpf_enabled == TRUE) {
+		call->current_params->avpf_rr_interval = linphone_call_get_avpf_rr_interval(call);
+	} else {
+		call->current_params->avpf_rr_interval = 0;
 	}
 
-	return &call->current_params;
-}
-
-static bool_t is_video_active(const SalStreamDescription *sd){
-	return sd->rtp_port!=0 && sd->dir!=SalStreamInactive;
+	return call->current_params;
 }
 
 /**
@@ -967,23 +1145,26 @@ static bool_t is_video_active(const SalStreamDescription *sd){
  * supports video, encryption or whatever.
 **/
 const LinphoneCallParams * linphone_call_get_remote_params(LinphoneCall *call){
-	LinphoneCallParams *cp=&call->remote_params;
-	memset(cp,0,sizeof(*cp));
 	if (call->op){
-		SalMediaDescription *md=sal_call_get_remote_media_description(call->op);
-		if (md){
-			SalStreamDescription *asd,*vsd,*secure_asd,*secure_vsd;
+		LinphoneCallParams *cp;
+		SalMediaDescription *md;
+		if (call->remote_params != NULL) linphone_call_params_unref(call->remote_params);
+		cp = call->remote_params = linphone_call_params_new();
+		md=sal_call_get_remote_media_description(call->op);
+		if (md) {
+			SalStreamDescription *sd;
+			unsigned int i;
+			unsigned int nb_audio_streams = sal_media_description_nb_active_streams_of_type(md, SalAudio);
+			unsigned int nb_video_streams = sal_media_description_nb_active_streams_of_type(md, SalVideo);
 
-			asd=sal_media_description_find_stream(md,SalProtoRtpAvp,SalAudio);
-			vsd=sal_media_description_find_stream(md,SalProtoRtpAvp,SalVideo);
-			secure_asd=sal_media_description_find_stream(md,SalProtoRtpSavp,SalAudio);
-			secure_vsd=sal_media_description_find_stream(md,SalProtoRtpSavp,SalVideo);
-			if (secure_vsd){
-				cp->has_video=is_video_active(secure_vsd);
-				if (secure_asd || asd==NULL)
-					cp->media_encryption=LinphoneMediaEncryptionSRTP;
-			}else if (vsd){
-				cp->has_video=is_video_active(vsd);
+			for (i = 0; i < nb_video_streams; i++) {
+				sd = sal_media_description_get_active_stream_of_type(md, SalVideo, i);
+				if (sal_stream_description_active(sd) == TRUE) cp->has_video = TRUE;
+				if (sal_stream_description_has_srtp(sd) == TRUE) cp->media_encryption = LinphoneMediaEncryptionSRTP;
+			}
+			for (i = 0; i < nb_audio_streams; i++) {
+				sd = sal_media_description_get_active_stream_of_type(md, SalAudio, i);
+				if (sal_stream_description_has_srtp(sd) == TRUE) cp->media_encryption = LinphoneMediaEncryptionSRTP;
 			}
 			if (!cp->has_video){
 				if (md->bandwidth>0 && md->bandwidth<=linphone_core_get_edge_bw(call->core)){
@@ -992,7 +1173,7 @@ const LinphoneCallParams * linphone_call_get_remote_params(LinphoneCall *call){
 			}
 			if (md->name[0]!='\0') linphone_call_params_set_session_name(cp,md->name);
 		}
-		cp->custom_headers=(SalCustomHeader*)sal_op_get_recv_custom_header(call->op);
+		cp->custom_headers=sal_custom_header_clone((SalCustomHeader*)sal_op_get_recv_custom_header(call->op));
 		return cp;
 	}
 	return NULL;
@@ -1039,27 +1220,26 @@ const LinphoneErrorInfo *linphone_call_get_error_info(const LinphoneCall *call){
 }
 
 /**
- * Get the user_pointer in the LinphoneCall
+ * Get the user pointer associated with the LinphoneCall
  *
  * @ingroup call_control
- *
- * return user_pointer an opaque user pointer that can be retrieved at any time
+ * @return  an opaque user pointer that can be retrieved at any time
 **/
-void *linphone_call_get_user_pointer(LinphoneCall *call)
+void *linphone_call_get_user_data(const LinphoneCall *call)
 {
-	return call->user_pointer;
+	return call->user_data;
 }
 
 /**
- * Set the user_pointer in the LinphoneCall
+ * Set the user pointer associated with the LinphoneCall
  *
  * @ingroup call_control
  *
- * the user_pointer is an opaque user pointer that can be retrieved at any time in the LinphoneCall
+ * the user pointer is an opaque user pointer that can be retrieved at any time in the LinphoneCall
 **/
-void linphone_call_set_user_pointer(LinphoneCall *call, void *user_pointer)
+void linphone_call_set_user_data(LinphoneCall *call, void *user_pointer)
 {
-	call->user_pointer = user_pointer;
+	call->user_data = user_pointer;
 }
 
 /**
@@ -1139,8 +1319,8 @@ bool_t linphone_call_has_transfer_pending(const LinphoneCall *call){
  * Returns call's duration in seconds.
 **/
 int linphone_call_get_duration(const LinphoneCall *call){
-	if (call->media_start_time==0) return 0;
-	return time(NULL)-call->media_start_time;
+	if (call->log->connected_date_time==0) return 0;
+	return time(NULL)-call->log->connected_date_time;
 }
 
 /**
@@ -1178,17 +1358,24 @@ void linphone_call_enable_camera (LinphoneCall *call, bool_t enable){
 /**
  * Request remote side to send us a Video Fast Update.
 **/
-void linphone_call_send_vfu_request(LinphoneCall *call)
-{
+void linphone_call_send_vfu_request(LinphoneCall *call) {
 #ifdef VIDEO_ENABLED
-	if (LinphoneCallStreamsRunning == linphone_call_get_state(call))
-		sal_call_send_vfu_request(call->op);
+	if (call->core->sip_conf.vfu_with_info) {
+		if (LinphoneCallStreamsRunning == linphone_call_get_state(call))
+			sal_call_send_vfu_request(call->op);
+	} else {
+		ms_message("vfu request using sip disabled from config [sip,vfu_with_info]");
+	}
 #endif
 }
 
 
 /**
  * Take a photo of currently received video and write it into a jpeg file.
+ * Note that the snapshot is asynchronous, an application shall not assume that the file is created when the function returns.
+ * @param call a LinphoneCall
+ * @param file a path where to write the jpeg content.
+ * @return 0 if successfull, -1 otherwise (typically if jpeg format is not supported).
 **/
 int linphone_call_take_video_snapshot(LinphoneCall *call, const char *file){
 #ifdef VIDEO_ENABLED
@@ -1196,6 +1383,23 @@ int linphone_call_take_video_snapshot(LinphoneCall *call, const char *file){
 		return ms_filter_call_method(call->videostream->jpegwriter,MS_JPEG_WRITER_TAKE_SNAPSHOT,(void*)file);
 	}
 	ms_warning("Cannot take snapshot: no currently running video stream on this call.");
+#endif
+	return -1;
+}
+
+/**
+ * Take a photo of currently captured video and write it into a jpeg file.
+ * Note that the snapshot is asynchronous, an application shall not assume that the file is created when the function returns.
+ * @param call a LinphoneCall
+ * @param file a path where to write the jpeg content.
+ * @return 0 if successfull, -1 otherwise (typically if jpeg format is not supported).
+**/
+int linphone_call_take_preview_snapshot(LinphoneCall *call, const char *file){
+#ifdef VIDEO_ENABLED
+	if (call->videostream!=NULL && call->videostream->local_jpegwriter!=NULL){
+		return ms_filter_call_method(call->videostream->local_jpegwriter,MS_JPEG_WRITER_TAKE_SNAPSHOT,(void*)file);
+	}
+	ms_warning("Cannot take local snapshot: no currently running video stream on this call.");
 	return -1;
 #endif
 	return -1;
@@ -1208,172 +1412,6 @@ bool_t linphone_call_camera_enabled (const LinphoneCall *call){
 	return call->camera_enabled;
 }
 
-/**
- * Enable video stream.
-**/
-void linphone_call_params_enable_video(LinphoneCallParams *cp, bool_t enabled){
-	cp->has_video=enabled;
-}
-
-/**
- * Returns the audio codec used in the call, described as a PayloadType structure.
-**/
-const PayloadType* linphone_call_params_get_used_audio_codec(const LinphoneCallParams *cp) {
-	return cp->audio_codec;
-}
-
-
-/**
- * Returns the video codec used in the call, described as a PayloadType structure.
-**/
-const PayloadType* linphone_call_params_get_used_video_codec(const LinphoneCallParams *cp) {
-	return cp->video_codec;
-}
-
-MSVideoSize linphone_call_params_get_sent_video_size(const LinphoneCallParams *cp) {
-	return cp->sent_vsize;
-}
-
-MSVideoSize linphone_call_params_get_received_video_size(const LinphoneCallParams *cp) {
-	return cp->recv_vsize;
-}
-
-/**
- * @ingroup call_control
- * Use to know if this call has been configured in low bandwidth mode.
- * This mode can be automatically discovered thanks to a stun server when activate_edge_workarounds=1 in section [net] of configuration file.
- * An application that would have reliable way to know network capacity may not use activate_edge_workarounds=1 but instead manually configure
- * low bandwidth mode with linphone_call_params_enable_low_bandwidth().
- * <br> When enabled, this param may transform a call request with video in audio only mode.
- * @return TRUE if low bandwidth has been configured/detected
- */
-bool_t linphone_call_params_low_bandwidth_enabled(const LinphoneCallParams *cp) {
-	return cp->low_bandwidth;
-}
-
-/**
- * @ingroup call_control
- * Indicate low bandwith mode.
- * Configuring a call to low bandwidth mode will result in the core to activate several settings for the call in order to ensure that bitrate usage
- * is lowered to the minimum possible. Typically, ptime (packetization time) will be increased, audio codec's output bitrate will be targetted to 20kbit/s provided
- * that it is achievable by the codec selected after SDP handshake. Video is automatically disabled.
- *
-**/
-void linphone_call_params_enable_low_bandwidth(LinphoneCallParams *cp, bool_t enabled){
-	cp->low_bandwidth=enabled;
-}
-
-/**
- * Returns whether video is enabled.
-**/
-bool_t linphone_call_params_video_enabled(const LinphoneCallParams *cp){
-	return cp->has_video;
-}
-
-/**
- * Returns kind of media encryption selected for the call.
-**/
-LinphoneMediaEncryption linphone_call_params_get_media_encryption(const LinphoneCallParams *cp) {
-	return cp->media_encryption;
-}
-
-/**
- * Set requested media encryption for a call.
-**/
-void linphone_call_params_set_media_encryption(LinphoneCallParams *cp, LinphoneMediaEncryption e) {
-	cp->media_encryption = e;
-}
-
-
-/**
- * Enable sending of real early media (during outgoing calls).
-**/
-void linphone_call_params_enable_early_media_sending(LinphoneCallParams *cp, bool_t enabled){
-	cp->real_early_media=enabled;
-}
-
-/**
- * Indicates whether sending of early media was enabled.
-**/
-bool_t linphone_call_params_early_media_sending_enabled(const LinphoneCallParams *cp){
-	return cp->real_early_media;
-}
-
-/**
- * Returns true if the call is part of the locally managed conference.
-**/
-bool_t linphone_call_params_local_conference_mode(const LinphoneCallParams *cp){
-	return cp->in_conference;
-}
-
-/**
- * Refine bandwidth settings for this call by setting a bandwidth limit for audio streams.
- * As a consequence, codecs whose bitrates are not compatible with this limit won't be used.
-**/
-void linphone_call_params_set_audio_bandwidth_limit(LinphoneCallParams *cp, int bandwidth){
-	cp->audio_bw=bandwidth;
-}
-
-void linphone_call_params_add_custom_header(LinphoneCallParams *params, const char *header_name, const char *header_value){
-	params->custom_headers=sal_custom_header_append(params->custom_headers,header_name,header_value);
-}
-
-const char *linphone_call_params_get_custom_header(const LinphoneCallParams *params, const char *header_name){
-	return sal_custom_header_find(params->custom_headers,header_name);
-}
-
-/**
- * Returns the session name of the media session (ie in SDP). Subject from the SIP message can be retrieved using linphone_call_params_get_custom_header() and is different.
- * @param cp the call parameters.
-**/
-const char *linphone_call_params_get_session_name(const LinphoneCallParams *cp){
-	return cp->session_name;
-}
-
-/**
- * Set the session name of the media session (ie in SDP). Subject from the SIP message (which is different) can be set using linphone_call_params_set_custom_header().
- * @param cp the call parameters.
- * @param name the session name
-**/
-void linphone_call_params_set_session_name(LinphoneCallParams *cp, const char *name){
-	if (cp->session_name){
-		ms_free(cp->session_name);
-		cp->session_name=NULL;
-	}
-	if (name) cp->session_name=ms_strdup(name);
-}
-
-void _linphone_call_params_copy(LinphoneCallParams *ncp, const LinphoneCallParams *cp){
-	if (ncp==cp) return;
-	memcpy(ncp,cp,sizeof(LinphoneCallParams));
-	if (cp->record_file) ncp->record_file=ms_strdup(cp->record_file);
-	if (cp->session_name) ncp->session_name=ms_strdup(cp->session_name);
-	/*
-	 * The management of the custom headers is not optimal. We copy everything while ref counting would be more efficient.
-	 */
-	if (cp->custom_headers) ncp->custom_headers=sal_custom_header_clone(cp->custom_headers);
-}
-
-/**
- * @ingroup call_control
- * Set requested level of privacy for the call.
- * \xmlonly <language-tags>javascript</language-tags> \endxmlonly
- * @param params the call parameters to be modified
- * @param LinphonePrivacy to configure privacy
- * */
-void linphone_call_params_set_privacy(LinphoneCallParams *params, LinphonePrivacyMask privacy) {
-	params->privacy=privacy;
-}
-
-/**
- * @ingroup call_control
- * Get requested level of privacy for the call.
- * @param params the call parameters
- * @return Privacy mode
- * */
-LinphonePrivacyMask linphone_call_params_get_privacy(const LinphoneCallParams *params) {
-	return params->privacy;
-}
 
 /**
  * @ingroup call_control
@@ -1390,27 +1428,6 @@ const char* linphone_privacy_to_string(LinphonePrivacy privacy) {
 	case LinphonePrivacyCritical: return "LinphonePrivacyCritical";
 	default: return "Unknown privacy mode";
 	}
-}
-/**
- * Copy existing LinphoneCallParams to a new LinphoneCallParams object.
-**/
-LinphoneCallParams * linphone_call_params_copy(const LinphoneCallParams *cp){
-	LinphoneCallParams *ncp=ms_new0(LinphoneCallParams,1);
-	_linphone_call_params_copy(ncp,cp);
-	return ncp;
-}
-
-void linphone_call_params_uninit(LinphoneCallParams *p){
-	if (p->record_file) ms_free(p->record_file);
-	if (p->custom_headers) sal_custom_header_free(p->custom_headers);
-}
-
-/**
- * Destroy LinphoneCallParams.
-**/
-void linphone_call_params_destroy(LinphoneCallParams *p){
-	linphone_call_params_uninit(p);
-	ms_free(p);
 }
 
 
@@ -1429,19 +1446,29 @@ static void rendercb(void *data, const MSPicture *local, const MSPicture *remote
 #ifdef VIDEO_ENABLED
 static void video_stream_event_cb(void *user_pointer, const MSFilter *f, const unsigned int event_id, const void *args){
 	LinphoneCall* call = (LinphoneCall*) user_pointer;
-	ms_warning("In linphonecall.c: video_stream_event_cb");
 	switch (event_id) {
 		case MS_VIDEO_DECODER_DECODING_ERRORS:
-			ms_warning("Case is MS_VIDEO_DECODER_DECODING_ERRORS");
+			ms_warning("MS_VIDEO_DECODER_DECODING_ERRORS");
 			if (call->videostream && (video_stream_is_decoding_error_to_be_reported(call->videostream, 5000) == TRUE)) {
 				video_stream_decoding_error_reported(call->videostream);
 				linphone_call_send_vfu_request(call);
 			}
 			break;
+		case MS_VIDEO_DECODER_RECOVERED_FROM_ERRORS:
+			ms_message("MS_VIDEO_DECODER_RECOVERED_FROM_ERRORS");
+			if (call->videostream) {
+				video_stream_decoding_error_recovered(call->videostream);
+			}
+			break;
 		case MS_VIDEO_DECODER_FIRST_IMAGE_DECODED:
 			ms_message("First video frame decoded successfully");
 			if (call->nextVideoFrameDecoded._func != NULL)
-			call->nextVideoFrameDecoded._func(call, call->nextVideoFrameDecoded._user_data);
+				call->nextVideoFrameDecoded._func(call, call->nextVideoFrameDecoded._user_data);
+			break;
+		case MS_VIDEO_DECODER_SEND_PLI:
+		case MS_VIDEO_DECODER_SEND_SLI:
+		case MS_VIDEO_DECODER_SEND_RPSI:
+			/* Handled internally by mediastreamer2. */
 			break;
 		default:
 			ms_warning("Unhandled event %i", event_id);
@@ -1466,14 +1493,14 @@ static void port_config_set_random_choosed(LinphoneCall *call, int stream_index,
 
 static void _linphone_call_prepare_ice_for_stream(LinphoneCall *call, int stream_index, bool_t create_checklist){
 	MediaStream *ms=stream_index == 0 ? (MediaStream*)call->audiostream : (MediaStream*)call->videostream;
-	if ((linphone_core_get_firewall_policy(call->core) == LinphonePolicyUseIce) && (call->ice_session != NULL)){
+	if ((_linphone_core_get_firewall_policy(call->core) == LinphonePolicyUseIce) && (call->ice_session != NULL)){
 		IceCheckList *cl;
 		rtp_session_set_pktinfo(ms->sessions.rtp_session, TRUE);
 		rtp_session_set_symmetric_rtp(ms->sessions.rtp_session, FALSE);
 		cl=ice_session_check_list(call->ice_session, stream_index);
 		if (cl == NULL && create_checklist) {
 			cl=ice_check_list_new();
-			ice_session_add_check_list(call->ice_session, cl);
+			ice_session_add_check_list(call->ice_session, cl, stream_index);
 			ms_message("Created new ICE check list for stream [%i]",stream_index);
 		}
 		if (cl){
@@ -1487,17 +1514,17 @@ int linphone_call_prepare_ice(LinphoneCall *call, bool_t incoming_offer){
 	SalMediaDescription *remote = NULL;
 	bool_t has_video=FALSE;
 
-	if ((linphone_core_get_firewall_policy(call->core) == LinphonePolicyUseIce) && (call->ice_session != NULL)){
+	if ((_linphone_core_get_firewall_policy(call->core) == LinphonePolicyUseIce) && (call->ice_session != NULL)){
 		if (incoming_offer){
 			remote=sal_call_get_remote_media_description(call->op);
-			has_video=linphone_core_media_description_contains_video_stream(remote);
-		}else has_video=call->params.has_video;
+			has_video=call->params->has_video && linphone_core_media_description_contains_video_stream(remote);
+		}else has_video=call->params->has_video;
 
 		_linphone_call_prepare_ice_for_stream(call,0,TRUE);
 		if (has_video) _linphone_call_prepare_ice_for_stream(call,1,TRUE);
 		/*start ICE gathering*/
 		if (incoming_offer)
-			linphone_core_update_ice_from_remote_media_description(call,remote); /*this may delete the ice session*/
+			linphone_call_update_ice_from_remote_media_description(call,remote); /*this may delete the ice session*/
 		if (call->ice_session && !ice_session_candidates_gathered(call->ice_session)){
 			if (call->audiostream->ms.state==MSStreamInitialized)
 				audio_stream_prepare_sound(call->audiostream, NULL, NULL);
@@ -1521,11 +1548,15 @@ int linphone_call_prepare_ice(LinphoneCall *call, bool_t incoming_offer){
 void linphone_call_init_audio_stream(LinphoneCall *call){
 	LinphoneCore *lc=call->core;
 	AudioStream *audiostream;
+	const char *location;
 	int dscp;
+	RtpTransport *meta_rtp=NULL;
+	RtpTransport *meta_rtcp=NULL;
 
 	if (call->audiostream != NULL) return;
 	if (call->sessions[0].rtp_session==NULL){
 		call->audiostream=audiostream=audio_stream_new(call->media_ports[0].rtp_port,call->media_ports[0].rtcp_port,call->af==AF_INET6);
+		rtp_session_set_symmetric_rtp(audiostream->ms.sessions.rtp_session,linphone_core_symmetric_rtp_enabled(lc));
 	}else{
 		call->audiostream=audio_stream_new_with_sessions(&call->sessions[0]);
 	}
@@ -1543,16 +1574,25 @@ void linphone_call_init_audio_stream(LinphoneCall *call){
 		else if (strcasecmp(type,"full")==0)
 			audio_stream_enable_echo_limiter(audiostream,ELControlFull);
 	}
+
+	/* equalizer location in the graph: 'mic' = in input graph, otherwise in output graph.
+		Any other value than mic will default to output graph for compatibility */
+	location = lp_config_get_string(lc->config,"sound","eq_location","hp");
+	audiostream->eq_loc = (strcasecmp(location,"mic") == 0) ? MSEqualizerMic : MSEqualizerHP;
+	ms_message("Equalizer location: %s", location);
+
 	audio_stream_enable_gain_control(audiostream,TRUE);
 	if (linphone_core_echo_cancellation_enabled(lc)){
 		int len,delay,framesize;
-		const char *statestr=lp_config_get_string(lc->config,"sound","ec_state",NULL);
+		char statestr[EC_STATE_MAX_LEN];
 		len=lp_config_get_int(lc->config,"sound","ec_tail_len",0);
 		delay=lp_config_get_int(lc->config,"sound","ec_delay",0);
 		framesize=lp_config_get_int(lc->config,"sound","ec_framesize",0);
 		audio_stream_set_echo_canceller_params(audiostream,len,delay,framesize);
-		if (statestr && audiostream->ec){
-			ms_filter_call_method(audiostream->ec,MS_ECHO_CANCELLER_SET_STATE_STRING,(void*)statestr);
+		if (audiostream->ec) {
+			if (lp_config_read_relative_file(lc->config, EC_STATE_STORE, statestr, EC_STATE_MAX_LEN) == 0) {
+				ms_filter_call_method(audiostream->ec, MS_ECHO_CANCELLER_SET_STATE_STRING, statestr);
+			}
 		}
 	}
 	audio_stream_enable_automatic_gain_control(audiostream,linphone_core_agc_enabled(lc));
@@ -1562,11 +1602,14 @@ void linphone_call_init_audio_stream(LinphoneCall *call){
 	}
 
 	audio_stream_set_features(audiostream,linphone_core_get_audio_features(lc));
-
-	if (lc->rtptf){
+	rtp_session_get_transports(audiostream->ms.sessions.rtp_session,&meta_rtp,&meta_rtcp);
+	if (lc->rtptf && (meta_rtp==NULL && meta_rtcp==NULL)){
+		/*the transport just need to be created once, then they are kept into the RtpSession, which is the same for the entire call duration.*/
 		RtpTransport *artp=lc->rtptf->audio_rtp_func(lc->rtptf->audio_rtp_func_data, call->media_ports[0].rtp_port);
 		RtpTransport *artcp=lc->rtptf->audio_rtcp_func(lc->rtptf->audio_rtcp_func_data, call->media_ports[0].rtcp_port);
-		rtp_session_set_transports(audiostream->ms.sessions.rtp_session,artp,artcp);
+		meta_rtp_transport_new(&meta_rtp,TRUE,artp, 0);
+		meta_rtp_transport_new(&meta_rtcp,FALSE,artcp, 0);
+		rtp_session_set_transports(audiostream->ms.sessions.rtp_session,meta_rtp,meta_rtcp);
 	}
 
 	call->audiostream_app_evq = ortp_ev_queue_new();
@@ -1586,6 +1629,7 @@ void linphone_call_init_video_stream(LinphoneCall *call){
 
 		if (call->sessions[1].rtp_session==NULL){
 			call->videostream=video_stream_new(call->media_ports[1].rtp_port,call->media_ports[1].rtcp_port, call->af==AF_INET6);
+			rtp_session_set_symmetric_rtp(call->videostream->ms.sessions.rtp_session,linphone_core_symmetric_rtp_enabled(lc));
 		}else{
 			call->videostream=video_stream_new_with_sessions(&call->sessions[1]);
 		}
@@ -1603,9 +1647,13 @@ void linphone_call_init_video_stream(LinphoneCall *call){
 		if (lc->rtptf){
 			RtpTransport *vrtp=lc->rtptf->video_rtp_func(lc->rtptf->video_rtp_func_data, call->media_ports[1].rtp_port);
 			RtpTransport *vrtcp=lc->rtptf->video_rtcp_func(lc->rtptf->video_rtcp_func_data, call->media_ports[1].rtcp_port);
-			rtp_session_set_transports(call->videostream->ms.sessions.rtp_session,vrtp,vrtcp);
+			RtpTransport *meta_rtp;
+			RtpTransport *meta_rtcp;
+			meta_rtp_transport_new(&meta_rtp,TRUE,vrtp, 0);
+			meta_rtp_transport_new(&meta_rtcp,FALSE,vrtcp, 0);
+			rtp_session_set_transports(call->videostream->ms.sessions.rtp_session,meta_rtp,meta_rtcp);
 		}
-			call->videostream_app_evq = ortp_ev_queue_new();
+		call->videostream_app_evq = ortp_ev_queue_new();
 		rtp_session_register_event_queue(call->videostream->ms.sessions.rtp_session,call->videostream_app_evq);
 		_linphone_call_prepare_ice_for_stream(call,1,FALSE);
 #ifdef TEST_EXT_RENDERER
@@ -1630,8 +1678,7 @@ static void linphone_core_dtmf_received(LinphoneCore *lc, int dtmf){
 		ms_warning("Bad dtmf value %i",dtmf);
 		return;
 	}
-	if (lc->vtable.dtmf_received != NULL)
-		lc->vtable.dtmf_received(lc, linphone_core_get_current_call(lc), dtmf_tab[dtmf]);
+	linphone_core_notify_dtmf_received(lc, linphone_core_get_current_call(lc), dtmf_tab[dtmf]);
 }
 
 static void parametrize_equalizer(LinphoneCore *lc, AudioStream *st){
@@ -1656,6 +1703,19 @@ static void parametrize_equalizer(LinphoneCore *lc, AudioStream *st){
 	}
 }
 
+void set_mic_gain_db(AudioStream *st, float gain){
+	if (st->volsend){
+		ms_filter_call_method(st->volsend,MS_VOLUME_SET_DB_GAIN,&gain);
+	}else ms_warning("Could not apply mic gain: gain control wasn't activated.");
+}
+
+void set_playback_gain_db(AudioStream *st, float gain){
+	if (st->volrecv){
+		ms_filter_call_method(st->volrecv,MS_VOLUME_SET_DB_GAIN,&gain);
+	}else ms_warning("Could not apply playback gain: gain control wasn't activated.");
+}
+
+/*This function is not static because used internally in linphone-daemon project*/
 void _post_configure_audio_stream(AudioStream *st, LinphoneCore *lc, bool_t muted){
 	float mic_gain=lc->sound_conf.soft_mic_lev;
 	float thres = 0;
@@ -1672,13 +1732,13 @@ void _post_configure_audio_stream(AudioStream *st, LinphoneCore *lc, bool_t mute
 	int spk_agc;
 
 	if (!muted)
-		linphone_core_set_mic_gain_db (lc, mic_gain);
+		set_mic_gain_db(st,mic_gain);
 	else
 		audio_stream_set_mic_gain(st,0);
 
 	recv_gain = lc->sound_conf.soft_play_lev;
 	if (recv_gain != 0) {
-		linphone_core_set_playback_gain_db (lc,recv_gain);
+		set_playback_gain_db(st,recv_gain);
 	}
 
 	if (st->volsend){
@@ -1714,11 +1774,11 @@ void _post_configure_audio_stream(AudioStream *st, LinphoneCore *lc, bool_t mute
 	parametrize_equalizer(lc,st);
 }
 
-static void post_configure_audio_streams(LinphoneCall*call){
+static void post_configure_audio_streams(LinphoneCall *call, bool_t muted){
 	AudioStream *st=call->audiostream;
 	LinphoneCore *lc=call->core;
-	_post_configure_audio_stream(st,lc,call->audio_muted);
-	if (lc->vtable.dtmf_received!=NULL){
+	_post_configure_audio_stream(st,lc,muted);
+	if (linphone_core_dtmf_received_has_listener(lc)){
 		audio_stream_play_received_dtmfs(call->audiostream,FALSE);
 	}
 	if (call->record_active)
@@ -1729,10 +1789,10 @@ static int get_ideal_audio_bw(LinphoneCall *call, const SalMediaDescription *md,
 	int remote_bw=0;
 	int upload_bw;
 	int total_upload_bw=linphone_core_get_upload_bandwidth(call->core);
-	const LinphoneCallParams *params=&call->params;
+	const LinphoneCallParams *params=call->params;
 	bool_t will_use_video=linphone_core_media_description_contains_video_stream(md);
 	bool_t forced=FALSE;
-	
+
 	if (desc->bandwidth>0) remote_bw=desc->bandwidth;
 	else if (md->bandwidth>0) {
 		/*case where b=AS is given globally, not per stream*/
@@ -1744,7 +1804,7 @@ static int get_ideal_audio_bw(LinphoneCall *call, const SalMediaDescription *md,
 	}else upload_bw=total_upload_bw;
 	upload_bw=get_min_bandwidth(upload_bw,remote_bw);
 	if (!will_use_video || forced) return upload_bw;
-	
+
 	if (bandwidth_is_greater(upload_bw,512)){
 		upload_bw=100;
 	}else if (bandwidth_is_greater(upload_bw,256)){
@@ -1776,14 +1836,15 @@ static RtpProfile *make_profile(LinphoneCall *call, const SalMediaDescription *m
 	bool_t first=TRUE;
 	LinphoneCore *lc=call->core;
 	int up_ptime=0;
-	const LinphoneCallParams *params=&call->params;
-	
+	const LinphoneCallParams *params=call->params;
+
 	*used_pt=-1;
+
 	if (desc->type==SalAudio)
 		bw=get_ideal_audio_bw(call,md,desc);
 	else if (desc->type==SalVideo)
 		bw=get_video_bw(call,md,desc);
-	
+
 	for(elem=desc->payloads;elem!=NULL;elem=elem->next){
 		PayloadType *pt=(PayloadType*)elem->data;
 		int number;
@@ -1805,6 +1866,7 @@ static RtpProfile *make_profile(LinphoneCall *call, const SalMediaDescription *m
 			first=FALSE;
 		}
 		if (pt->flags & PAYLOAD_TYPE_BITRATE_OVERRIDE){
+			ms_message("Payload type [%s/%i] has explicit bitrate [%i] kbit/s", pt->mime_type, pt->clock_rate, pt->normal_bitrate/1000);
 			pt->normal_bitrate=get_min_bandwidth(pt->normal_bitrate,bw*1000);
 		} else pt->normal_bitrate=bw*1000;
 		if (desc->ptime>0){
@@ -1855,13 +1917,14 @@ static void configure_rtp_session_for_rtcp_xr(LinphoneCore *lc, LinphoneCall *ca
 	OrtpRtcpXrConfiguration currentconfig;
 	const SalStreamDescription *localstream;
 	const SalStreamDescription *remotestream;
+	SalMediaDescription *remotedesc = sal_call_get_remote_media_description(call->op);
 
-	localstream = sal_media_description_find_stream(call->localdesc, SalProtoRtpSavp, type);
-	if (!localstream) localstream = sal_media_description_find_stream(call->localdesc, SalProtoRtpAvp, type);
+	if (!remotedesc) return;
+
+	localstream = sal_media_description_find_best_stream(call->localdesc, type);
 	if (!localstream) return;
 	localconfig = &localstream->rtcp_xr;
-	remotestream = sal_media_description_find_stream(sal_call_get_remote_media_description(call->op), SalProtoRtpSavp, type);
-	if (!remotestream) remotestream = sal_media_description_find_stream(sal_call_get_remote_media_description(call->op), SalProtoRtpAvp, type);
+	remotestream = sal_media_description_find_best_stream(remotedesc, type);
 	if (!remotestream) return;
 	remoteconfig = &remotestream->rtcp_xr;
 
@@ -1880,19 +1943,11 @@ static void configure_rtp_session_for_rtcp_xr(LinphoneCore *lc, LinphoneCall *ca
 		session = call->videostream->ms.sessions.rtp_session;
 	}
 	rtp_session_configure_rtcp_xr(session, &currentconfig);
-	if (currentconfig.rcvr_rtt_mode != OrtpRtcpXrRcvrRttNone) {
-		rtp_session_set_rtcp_xr_rcvr_rtt_interval(session, lp_config_get_int(lc->config, "rtp", "rtcp_xr_rcvr_rtt_interval_duration", 5000));
-	}
-	if (currentconfig.stat_summary_enabled == TRUE) {
-		rtp_session_set_rtcp_xr_stat_summary_interval(session, lp_config_get_int(lc->config, "rtp", "rtcp_xr_stat_summary_interval_duration", 5000));
-	}
-	if (currentconfig.voip_metrics_enabled == TRUE) {
-		rtp_session_set_rtcp_xr_voip_metrics_interval(session, lp_config_get_int(lc->config, "rtp", "rtcp_xr_voip_metrics_interval_duration", 5000));
-	}
 }
 
 static void linphone_call_start_audio_stream(LinphoneCall *call, const char *cname, bool_t muted, bool_t send_ringbacktone, bool_t use_arc){
 	LinphoneCore *lc=call->core;
+	LpConfig* conf;
 	int used_pt=-1;
 	char rtcp_tool[128]={0};
 	const SalStreamDescription *stream;
@@ -1906,14 +1961,8 @@ static void linphone_call_start_audio_stream(LinphoneCall *call, const char *cna
 	int crypto_idx;
 
 	snprintf(rtcp_tool,sizeof(rtcp_tool)-1,"%s-%s",linphone_core_get_user_agent_name(),linphone_core_get_user_agent_version());
-	/* look for savp stream first */
-	stream=sal_media_description_find_stream(call->resultdesc,
-							SalProtoRtpSavp,SalAudio);
-	/* no savp audio stream, use avp */
-	if (!stream)
-		stream=sal_media_description_find_stream(call->resultdesc,
-							SalProtoRtpAvp,SalAudio);
 
+	stream = sal_media_description_find_best_stream(call->resultdesc, SalAudio);
 	if (stream && stream->dir!=SalStreamInactive && stream->rtp_port!=0){
 		playcard=lc->sound_conf.lsd_card ?
 			lc->sound_conf.lsd_card : lc->sound_conf.play_sndcard;
@@ -1923,7 +1972,7 @@ static void linphone_call_start_audio_stream(LinphoneCall *call, const char *cna
 		call->audio_profile=make_profile(call,call->resultdesc,stream,&used_pt);
 
 		if (used_pt!=-1){
-			call->current_params.audio_codec = rtp_profile_get_payload(call->audio_profile, used_pt);
+			call->current_params->audio_codec = rtp_profile_get_payload(call->audio_profile, used_pt);
 			if (playcard==NULL) {
 				ms_warning("No card defined for playback !");
 			}
@@ -1943,15 +1992,20 @@ static void linphone_call_start_audio_stream(LinphoneCall *call, const char *cna
 				/*playfile=NULL;*/
 			}
 			if (send_ringbacktone){
+				conf = linphone_core_get_config(lc);
 				captcard=NULL;
 				playfile=NULL;/* it is setup later*/
+				if( conf && lp_config_get_int(conf,"sound","send_ringback_without_playback", 0) == 1){
+					playcard = NULL;
+					recfile = NULL;
+				}
 			}
 			/*if playfile are supplied don't use soundcards*/
 			if (lc->use_files) {
 				captcard=NULL;
 				playcard=NULL;
 			}
-			if (call->params.in_conference){
+			if (call->params->in_conference){
 				/* first create the graph without soundcard resources*/
 				captcard=playcard=NULL;
 			}
@@ -1963,19 +2017,21 @@ static void linphone_call_start_audio_stream(LinphoneCall *call, const char *cna
 			if (playcard &&  stream->max_rate>0) ms_snd_card_set_preferred_sample_rate(playcard, stream->max_rate);
 			if (captcard &&  stream->max_rate>0) ms_snd_card_set_preferred_sample_rate(captcard, stream->max_rate);
 			audio_stream_enable_adaptive_bitrate_control(call->audiostream,use_arc);
+			media_stream_set_adaptive_bitrate_algorithm(&call->audiostream->ms,
+													  ms_qos_analyzer_algorithm_from_string(linphone_core_get_adaptive_rate_algorithm(lc)));
 			audio_stream_enable_adaptive_jittcomp(call->audiostream, linphone_core_audio_adaptive_jittcomp_enabled(lc));
-			if (!call->params.in_conference && call->params.record_file){
-				audio_stream_mixed_record_open(call->audiostream,call->params.record_file);
-				call->current_params.record_file=ms_strdup(call->params.record_file);
+			if (!call->params->in_conference && call->params->record_file){
+				audio_stream_mixed_record_open(call->audiostream,call->params->record_file);
+				call->current_params->record_file=ms_strdup(call->params->record_file);
 			}
 			/* valid local tags are > 0 */
-			if (stream->proto == SalProtoRtpSavp) {
-				local_st_desc=sal_media_description_find_stream(call->localdesc,SalProtoRtpSavp,SalAudio);
+			if (sal_stream_description_has_srtp(stream) == TRUE) {
+				local_st_desc=sal_media_description_find_stream(call->localdesc,stream->proto,SalAudio);
 				crypto_idx = find_crypto_index_from_tag(local_st_desc->crypto, stream->crypto_local_tag);
 
 				if (crypto_idx >= 0) {
-					media_stream_set_srtp_recv_key(&call->audiostream->ms,stream->crypto[0].algo,stream->crypto[0].master_key);
-					media_stream_set_srtp_send_key(&call->audiostream->ms,stream->crypto[0].algo,local_st_desc->crypto[crypto_idx].master_key);
+					media_stream_set_srtp_recv_key(&call->audiostream->ms,stream->crypto[0].algo,stream->crypto[0].master_key, TRUE);
+					media_stream_set_srtp_send_key(&call->audiostream->ms,stream->crypto[0].algo,local_st_desc->crypto[crypto_idx].master_key, TRUE);
 				} else {
 					ms_warning("Failed to find local crypto algo with tag: %d", stream->crypto_local_tag);
 				}
@@ -1997,10 +2053,7 @@ static void linphone_call_start_audio_stream(LinphoneCall *call, const char *cna
 				captcard,
 				use_ec
 				);
-			post_configure_audio_streams(call);
-			if (muted && !send_ringbacktone){
-				audio_stream_set_mic_gain(call->audiostream,0);
-			}
+			post_configure_audio_streams(call, muted && !send_ringbacktone);
 			if (stream->dir==SalStreamSendOnly && playfile!=NULL){
 				int pause_time=500;
 				ms_filter_call_method(call->audiostream->soundread,MS_FILE_PLAYER_LOOP,&pause_time);
@@ -2009,13 +2062,13 @@ static void linphone_call_start_audio_stream(LinphoneCall *call, const char *cna
 				setup_ring_player(lc,call);
 			}
 
-			if (call->params.in_conference){
+			if (call->params->in_conference){
 				/*transform the graph to connect it to the conference filter */
 				mute=stream->dir==SalStreamRecvOnly;
 				linphone_call_add_to_conf(call, mute);
 			}
-			call->current_params.in_conference=call->params.in_conference;
-			call->current_params.low_bandwidth=call->params.low_bandwidth;
+			call->current_params->in_conference=call->params->in_conference;
+			call->current_params->low_bandwidth=call->params->low_bandwidth;
 		}else ms_warning("No audio stream accepted ?");
 	}
 }
@@ -2024,24 +2077,23 @@ static void linphone_call_start_video_stream(LinphoneCall *call, const char *cna
 #ifdef VIDEO_ENABLED
 	LinphoneCore *lc=call->core;
 	int used_pt=-1;
-
-	/* look for savp stream first */
-	const SalStreamDescription *vstream=sal_media_description_find_stream(call->resultdesc,
-							SalProtoRtpSavp,SalVideo);
 	char rtcp_tool[128]={0};
-	snprintf(rtcp_tool,sizeof(rtcp_tool)-1,"%s-%s",linphone_core_get_user_agent_name(),linphone_core_get_user_agent_version());
+	const SalStreamDescription *vstream;
+	MSFilter* source = NULL;
+	bool_t reused_preview = FALSE;
 
-	/* no savp audio stream, use avp */
-	if (!vstream)
-		vstream=sal_media_description_find_stream(call->resultdesc,
-							SalProtoRtpAvp,SalVideo);
+	snprintf(rtcp_tool,sizeof(rtcp_tool)-1,"%s-%s",linphone_core_get_user_agent_name(),linphone_core_get_user_agent_version());
 
 	/* shutdown preview */
 	if (lc->previewstream!=NULL) {
-		video_preview_stop(lc->previewstream);
+
+		if( lc->video_conf.reuse_preview_source == FALSE) video_preview_stop(lc->previewstream);
+		else source = video_preview_stop_reuse_source(lc->previewstream);
+
 		lc->previewstream=NULL;
 	}
 
+	vstream = sal_media_description_find_best_stream(call->resultdesc, SalVideo);
 	if (vstream!=NULL && vstream->dir!=SalStreamInactive && vstream->rtp_port!=0) {
 		const char *rtp_addr=vstream->rtp_addr[0]!='\0' ? vstream->rtp_addr : call->resultdesc->addr;
 		const char *rtcp_addr=vstream->rtcp_addr[0]!='\0' ? vstream->rtcp_addr : call->resultdesc->addr;
@@ -2054,12 +2106,17 @@ static void linphone_call_start_video_stream(LinphoneCall *call, const char *cna
 			MSWebCam *cam=lc->video_conf.device;
 			bool_t is_inactive=FALSE;
 
-			call->current_params.video_codec = rtp_profile_get_payload(call->video_profile, used_pt);
-			call->current_params.has_video=TRUE;
+			call->current_params->video_codec = rtp_profile_get_payload(call->video_profile, used_pt);
+			call->current_params->has_video=TRUE;
 
 			video_stream_enable_adaptive_bitrate_control(call->videostream,
 													  linphone_core_adaptive_rate_control_enabled(lc));
+			media_stream_set_adaptive_bitrate_algorithm(&call->videostream->ms,
+													  ms_qos_analyzer_algorithm_from_string(linphone_core_get_adaptive_rate_algorithm(lc)));
 			video_stream_enable_adaptive_jittcomp(call->videostream, linphone_core_video_adaptive_jittcomp_enabled(lc));
+			if (lc->video_conf.preview_vsize.width!=0)
+				video_stream_set_preview_size(call->videostream,lc->video_conf.preview_vsize);
+			video_stream_set_fps(call->videostream,linphone_core_get_preferred_framerate(lc));
 			video_stream_set_sent_video_size(call->videostream,linphone_core_get_preferred_video_size(lc));
 			video_stream_enable_self_view(call->videostream,lc->video_conf.selfview);
 			if (lc->video_window_id!=0)
@@ -2092,11 +2149,11 @@ static void linphone_call_start_video_stream(LinphoneCall *call, const char *cna
 				cam=get_nowebcam_device();
 			}
 			if (!is_inactive){
-				if (vstream->proto == SalProtoRtpSavp) {
+				if (sal_stream_description_has_srtp(vstream) == TRUE) {
 					int crypto_idx = find_crypto_index_from_tag(local_st_desc->crypto, vstream->crypto_local_tag);
 					if (crypto_idx >= 0) {
-						media_stream_set_srtp_recv_key(&call->videostream->ms,vstream->crypto[0].algo,vstream->crypto[0].master_key);
-						media_stream_set_srtp_send_key(&call->videostream->ms,vstream->crypto[0].algo,local_st_desc->crypto[crypto_idx].master_key);
+						media_stream_set_srtp_recv_key(&call->videostream->ms,vstream->crypto[0].algo,vstream->crypto[0].master_key, TRUE);
+						media_stream_set_srtp_send_key(&call->videostream->ms,vstream->crypto[0].algo,local_st_desc->crypto[crypto_idx].master_key, TRUE);
 					}
 				}
 				configure_rtp_session_for_rtcp_xr(lc, call, SalVideo);
@@ -2106,15 +2163,31 @@ static void linphone_call_start_video_stream(LinphoneCall *call, const char *cna
 				ms_message("%s lc rotation:%d\n", __FUNCTION__, lc->device_rotation);
 				video_stream_set_device_rotation(call->videostream, lc->device_rotation);
 				video_stream_set_rtcp_information(call->videostream, cname, rtcp_tool);
-				video_stream_start(call->videostream,
-					call->video_profile, rtp_addr, vstream->rtp_port,
-					rtcp_addr,
-					linphone_core_rtcp_enabled(lc) ? (vstream->rtcp_port ? vstream->rtcp_port : vstream->rtp_port+1) : 0,
-					used_pt, linphone_core_get_video_jittcomp(lc), cam);
+				video_stream_set_freeze_on_error(call->videostream, lp_config_get_int(lc->config, "video", "freeze_on_error", 0));
+				if( lc->video_conf.reuse_preview_source && source ){
+					ms_message("video_stream_start_with_source kept: %p", source);
+					video_stream_start_with_source(call->videostream,
+												   call->video_profile, rtp_addr, vstream->rtp_port,
+												   rtcp_addr,
+												   linphone_core_rtcp_enabled(lc) ? (vstream->rtcp_port ? vstream->rtcp_port : vstream->rtp_port+1) : 0,
+												   used_pt, linphone_core_get_video_jittcomp(lc), cam, source);
+					reused_preview = TRUE;
+				} else {
+					video_stream_start(call->videostream,
+									   call->video_profile, rtp_addr, vstream->rtp_port,
+									   rtcp_addr,
+									   linphone_core_rtcp_enabled(lc) ? (vstream->rtcp_port ? vstream->rtcp_port : vstream->rtp_port+1) : 0,
+									   used_pt, linphone_core_get_video_jittcomp(lc), cam);
+				}
 			}
 		}else ms_warning("No video stream accepted.");
 	}else{
-		ms_warning("No valid video stream defined.");
+		ms_message("No valid video stream defined.");
+	}
+	if( reused_preview == FALSE && source != NULL ){
+		/* destroy not-reused source filter */
+		ms_warning("Video preview (%p) not reused: destroying it.", source);
+		ms_filter_destroy(source);
 	}
 #endif
 }
@@ -2125,12 +2198,11 @@ void linphone_call_start_media_streams(LinphoneCall *call, bool_t all_inputs_mut
 	char *cname;
 	bool_t use_arc=linphone_core_adaptive_rate_control_enabled(lc);
 #ifdef VIDEO_ENABLED
-	const SalStreamDescription *vstream=sal_media_description_find_stream(call->resultdesc,
-								SalProtoRtpAvp,SalVideo);
+	const SalStreamDescription *vstream=sal_media_description_find_best_stream(call->resultdesc,SalVideo);
 #endif
 
-	call->current_params.audio_codec = NULL;
-	call->current_params.video_codec = NULL;
+	call->current_params->audio_codec = NULL;
+	call->current_params->video_codec = NULL;
 
 	if ((call->audiostream == NULL) && (call->videostream == NULL)) {
 		ms_fatal("start_media_stream() called without prior init !");
@@ -2144,11 +2216,15 @@ void linphone_call_start_media_streams(LinphoneCall *call, bool_t all_inputs_mut
 		use_arc=FALSE;
 	}
 #endif
+	ms_message("linphone_call_start_media_streams() call=[%p] local upload_bandwidth=[%i] kbit/s; local download_bandwidth=[%i] kbit/s",
+		   call, linphone_core_get_upload_bandwidth(lc),linphone_core_get_download_bandwidth(lc));
+
 	if (call->audiostream!=NULL) {
-		linphone_call_start_audio_stream(call,cname,all_inputs_muted,send_ringbacktone,use_arc);
+		linphone_call_start_audio_stream(call,cname,all_inputs_muted||call->audio_muted,send_ringbacktone,use_arc);
 	}
-	call->current_params.has_video=FALSE;
+	call->current_params->has_video=FALSE;
 	if (call->videostream!=NULL) {
+		if (call->audiostream) audio_stream_link_video(call->audiostream,call->videostream);
 		linphone_call_start_video_stream(call,cname,all_inputs_muted);
 	}
 
@@ -2156,21 +2232,21 @@ void linphone_call_start_media_streams(LinphoneCall *call, bool_t all_inputs_mut
 	call->playing_ringbacktone=send_ringbacktone;
 	call->up_bw=linphone_core_get_upload_bandwidth(lc);
 
-	if (call->params.media_encryption==LinphoneMediaEncryptionZRTP) {
-		OrtpZrtpParams params;
-		memset(&params,0,sizeof(OrtpZrtpParams));
+	if (call->params->media_encryption==LinphoneMediaEncryptionZRTP) {
+		MSZrtpParams params;
+		memset(&params,0,sizeof(MSZrtpParams));
 		/*call->current_params.media_encryption will be set later when zrtp is activated*/
 		params.zid_file=lc->zrtp_secrets_cache;
 		audio_stream_enable_zrtp(call->audiostream,&params);
 #if VIDEO_ENABLED
-		if (media_stream_is_secured((MediaStream *)call->audiostream) && media_stream_get_state((MediaStream *)call->videostream) == MSStreamStarted) {
+		if (media_stream_secured((MediaStream *)call->audiostream) && media_stream_get_state((MediaStream *)call->videostream) == MSStreamStarted) {
 			/*audio stream is already encrypted and video stream is active*/
-			memset(&params,0,sizeof(OrtpZrtpParams));
+			memset(&params,0,sizeof(MSZrtpParams));
 			video_stream_enable_zrtp(call->videostream,call->audiostream,&params);
 		}
 #endif
 	}else{
-		call->current_params.media_encryption=linphone_call_are_all_streams_encrypted(call) ?
+		call->current_params->media_encryption=linphone_call_all_streams_encrypted(call) ?
 			LinphoneMediaEncryptionSRTP : LinphoneMediaEncryptionNone;
 	}
 
@@ -2196,10 +2272,10 @@ void linphone_call_stop_media_streams_for_ice_gathering(LinphoneCall *call){
 static bool_t update_stream_crypto_params(LinphoneCall *call, const SalStreamDescription *local_st_desc, SalStreamDescription *old_stream, SalStreamDescription *new_stream, MediaStream *ms){
 	int crypto_idx = find_crypto_index_from_tag(local_st_desc->crypto, new_stream->crypto_local_tag);
 	if (crypto_idx >= 0) {
-		if (call->localdesc_changed & SAL_MEDIA_DESCRIPTION_CRYPTO_CHANGED)
-			media_stream_set_srtp_send_key(ms,new_stream->crypto[0].algo,local_st_desc->crypto[crypto_idx].master_key);
+		if (call->localdesc_changed & SAL_MEDIA_DESCRIPTION_CRYPTO_KEYS_CHANGED)
+			media_stream_set_srtp_send_key(ms,new_stream->crypto[0].algo,local_st_desc->crypto[crypto_idx].master_key, TRUE);
 		if (strcmp(old_stream->crypto[0].master_key,new_stream->crypto[0].master_key)!=0){
-			media_stream_set_srtp_recv_key(ms,new_stream->crypto[0].algo,new_stream->crypto[0].master_key);
+			media_stream_set_srtp_recv_key(ms,new_stream->crypto[0].algo,new_stream->crypto[0].master_key,TRUE);
 		}
 		return TRUE;
 	} else {
@@ -2213,17 +2289,17 @@ void linphone_call_update_crypto_parameters(LinphoneCall *call, SalMediaDescript
 	SalStreamDescription *new_stream;
 	const SalStreamDescription *local_st_desc;
 
-	local_st_desc = sal_media_description_find_stream(call->localdesc, SalProtoRtpSavp, SalAudio);
-	old_stream = sal_media_description_find_stream(old_md, SalProtoRtpSavp, SalAudio);
-	new_stream = sal_media_description_find_stream(new_md, SalProtoRtpSavp, SalAudio);
+	local_st_desc = sal_media_description_find_secure_stream_of_type(call->localdesc, SalAudio);
+	old_stream = sal_media_description_find_secure_stream_of_type(old_md, SalAudio);
+	new_stream = sal_media_description_find_secure_stream_of_type(new_md, SalAudio);
 	if (call->audiostream && local_st_desc && old_stream && new_stream &&
 		update_stream_crypto_params(call,local_st_desc,old_stream,new_stream,&call->audiostream->ms)){
 	}
 
 #ifdef VIDEO_ENABLED
-	local_st_desc = sal_media_description_find_stream(call->localdesc, SalProtoRtpSavp, SalVideo);
-	old_stream = sal_media_description_find_stream(old_md, SalProtoRtpSavp, SalVideo);
-	new_stream = sal_media_description_find_stream(new_md, SalProtoRtpSavp, SalVideo);
+	local_st_desc = sal_media_description_find_secure_stream_of_type(call->localdesc, SalVideo);
+	old_stream = sal_media_description_find_secure_stream_of_type(old_md, SalVideo);
+	new_stream = sal_media_description_find_secure_stream_of_type(new_md, SalVideo);
 	if (call->videostream && local_st_desc && old_stream && new_stream &&
 		update_stream_crypto_params(call,local_st_desc,old_stream,new_stream,&call->videostream->ms)){
 	}
@@ -2269,9 +2345,9 @@ static void linphone_call_log_fill_stats(LinphoneCallLog *log, MediaStream *st){
 	}
 }
 
-void linphone_call_stop_audio_stream(LinphoneCall *call) {
+static void linphone_call_stop_audio_stream(LinphoneCall *call) {
 	if (call->audiostream!=NULL) {
-		linphone_reporting_update(call, LINPHONE_CALL_STATS_AUDIO);
+		linphone_reporting_update_media_info(call, LINPHONE_CALL_STATS_AUDIO);
 		media_stream_reclaim_sessions(&call->audiostream->ms,&call->sessions[0]);
 		rtp_session_unregister_event_queue(call->audiostream->ms.sessions.rtp_session,call->audiostream_app_evq);
 		ortp_ev_queue_flush(call->audiostream_app_evq);
@@ -2283,7 +2359,7 @@ void linphone_call_stop_audio_stream(LinphoneCall *call) {
 			ms_filter_call_method(call->audiostream->ec,MS_ECHO_CANCELLER_GET_STATE_STRING,&state_str);
 			if (state_str){
 				ms_message("Writing echo canceler state, %i bytes",(int)strlen(state_str));
-				lp_config_set_string(call->core->config,"sound","ec_state",state_str);
+				lp_config_write_relative_file(call->core->config, EC_STATE_STORE, state_str);
 			}
 		}
 		audio_stream_get_local_rtp_stats(call->audiostream,&call->log->local_stats);
@@ -2293,14 +2369,14 @@ void linphone_call_stop_audio_stream(LinphoneCall *call) {
 		}
 		audio_stream_stop(call->audiostream);
 		call->audiostream=NULL;
-		call->current_params.audio_codec = NULL;
+		call->current_params->audio_codec = NULL;
 	}
 }
 
-void linphone_call_stop_video_stream(LinphoneCall *call) {
+static void linphone_call_stop_video_stream(LinphoneCall *call) {
 #ifdef VIDEO_ENABLED
 	if (call->videostream!=NULL){
-		linphone_reporting_update(call, LINPHONE_CALL_STATS_VIDEO);
+		linphone_reporting_update_media_info(call, LINPHONE_CALL_STATS_VIDEO);
 		media_stream_reclaim_sessions(&call->videostream->ms,&call->sessions[1]);
 		rtp_session_unregister_event_queue(call->videostream->ms.sessions.rtp_session,call->videostream_app_evq);
 		ortp_ev_queue_flush(call->videostream_app_evq);
@@ -2309,7 +2385,7 @@ void linphone_call_stop_video_stream(LinphoneCall *call) {
 		linphone_call_log_fill_stats(call->log,(MediaStream*)call->videostream);
 		video_stream_stop(call->videostream);
 		call->videostream=NULL;
-		call->current_params.video_codec = NULL;
+		call->current_params->video_codec = NULL;
 	}
 #endif
 }
@@ -2321,6 +2397,8 @@ static void unset_rtp_profile(LinphoneCall *call, int i){
 
 void linphone_call_stop_media_streams(LinphoneCall *call){
 	if (call->audiostream || call->videostream) {
+		if (call->audiostream && call->videostream)
+			audio_stream_unlink_video(call->audiostream, call->videostream);
 		linphone_call_stop_audio_stream(call);
 		linphone_call_stop_video_stream(call);
 
@@ -2492,6 +2570,27 @@ const LinphoneCallStats *linphone_call_get_video_stats(LinphoneCall *call) {
 	return stats;
 }
 
+static bool_t ice_in_progress(LinphoneCallStats *stats){
+	return stats->ice_state==LinphoneIceStateInProgress;
+}
+
+/**
+ * Indicates whether an operation is in progress at the media side.
+ * It can a bad idea to initiate signaling operations (adding video, pausing the call, removing video, changing video parameters) while
+ * the media is busy in establishing the connection (typically ICE connectivity checks). It can result in failures generating loss of time
+ * in future operations in the call.
+ * Applications are invited to check this function after each call state change to decide whether certain operations are permitted or not.
+ * @param call the call
+ * @return TRUE if media is busy in establishing the connection, FALSE otherwise.
+**/
+bool_t linphone_call_media_in_progress(LinphoneCall *call){
+	bool_t ret=FALSE;
+	if (ice_in_progress(&call->stats[LINPHONE_CALL_STATS_AUDIO]) || ice_in_progress(&call->stats[LINPHONE_CALL_STATS_VIDEO]))
+		ret=TRUE;
+	/*TODO: could check zrtp state, upnp state*/
+	return ret;
+}
+
 /**
  * Get the local loss rate since last report
  * @return The sender loss rate
@@ -2608,36 +2707,49 @@ uint64_t linphone_call_stats_get_late_packets_cumulative_number(const LinphoneCa
 	if (!stats || !call)
 		return 0;
 	memset(&rtp_stats, 0, sizeof(rtp_stats));
-	if (stats->type == LINPHONE_CALL_STATS_AUDIO)
+	if (stats->type == LINPHONE_CALL_STATS_AUDIO && call->audiostream != NULL)
 		audio_stream_get_local_rtp_stats(call->audiostream, &rtp_stats);
 #ifdef VIDEO_ENABLED
-	else
+	else if (call->videostream != NULL)
 		video_stream_get_local_rtp_stats(call->videostream, &rtp_stats);
 #endif
 	return rtp_stats.outoftime;
 }
 
 /**
- * Enable recording of the call (voice-only).
- * This function must be used before the call parameters are assigned to the call.
- * The call recording can be started and paused after the call is established with
- * linphone_call_start_recording() and linphone_call_pause_recording().
- * @param cp the call parameters
- * @param path path and filename of the file where audio is written.
-**/
-void linphone_call_params_set_record_file(LinphoneCallParams *cp, const char *path){
-	if (cp->record_file){
-		ms_free(cp->record_file);
-		cp->record_file=NULL;
-	}
-	if (path) cp->record_file=ms_strdup(path);
+ * Get the bandwidth measurement of the received stream, expressed in kbit/s, including IP/UDP/RTP headers.
+ * @param[in] stats LinphoneCallStats object
+ * @return The bandwidth measurement of the received stream in kbit/s.
+ */
+float linphone_call_stats_get_download_bandwidth(const LinphoneCallStats *stats) {
+	return stats->download_bandwidth;
 }
 
 /**
- * Retrieves the path for the audio recoding of the call.
-**/
-const char *linphone_call_params_get_record_file(const LinphoneCallParams *cp){
-	return cp->record_file;
+ * Get the bandwidth measurement of the sent stream, expressed in kbit/s, including IP/UDP/RTP headers.
+ * @param[in] stats LinphoneCallStats object
+ * @return The bandwidth measurement of the sent stream in kbit/s.
+ */
+float linphone_call_stats_get_upload_bandwidth(const LinphoneCallStats *stats) {
+	return stats->upload_bandwidth;
+}
+
+/**
+ * Get the state of ICE processing.
+ * @param[in] stats LinphoneCallStats object
+ * @return The state of ICE processing.
+ */
+LinphoneIceState linphone_call_stats_get_ice_state(const LinphoneCallStats *stats) {
+	return stats->ice_state;
+}
+
+/**
+ * Get the state of uPnP processing.
+ * @param[in] stats LinphoneCallStats object
+ * @return The state of uPnP processing.
+ */
+LinphoneUpnpState linphone_call_stats_get_upnp_state(const LinphoneCallStats *stats) {
+	return stats->upnp_state;
 }
 
 /**
@@ -2645,11 +2757,11 @@ const char *linphone_call_params_get_record_file(const LinphoneCallParams *cp){
  * The output file where audio is recorded must be previously specified with linphone_call_params_set_record_file().
 **/
 void linphone_call_start_recording(LinphoneCall *call){
-	if (!call->params.record_file){
+	if (!call->params->record_file){
 		ms_error("linphone_call_start_recording(): no output file specified. Use linphone_call_params_set_record_file().");
 		return;
 	}
-	if (call->audiostream && !call->params.in_conference){
+	if (call->audiostream && !call->params->in_conference){
 		audio_stream_mixed_record_start(call->audiostream);
 	}
 	call->record_active=TRUE;
@@ -2659,7 +2771,7 @@ void linphone_call_start_recording(LinphoneCall *call){
  * Stop call recording.
 **/
 void linphone_call_stop_recording(LinphoneCall *call){
-	if (call->audiostream && !call->params.in_conference){
+	if (call->audiostream && !call->params->in_conference){
 		audio_stream_mixed_record_stop(call->audiostream);
 	}
 	call->record_active=FALSE;
@@ -2670,36 +2782,43 @@ void linphone_call_stop_recording(LinphoneCall *call){
 **/
 
 static void report_bandwidth(LinphoneCall *call, MediaStream *as, MediaStream *vs){
-	call->stats[LINPHONE_CALL_STATS_AUDIO].download_bandwidth=(as!=NULL) ? (media_stream_get_down_bw(as)*1e-3) : 0;
-	call->stats[LINPHONE_CALL_STATS_AUDIO].upload_bandwidth=(as!=NULL) ? (media_stream_get_up_bw(as)*1e-3) : 0;
-	call->stats[LINPHONE_CALL_STATS_VIDEO].download_bandwidth=(vs!=NULL) ? (media_stream_get_down_bw(vs)*1e-3) : 0;
-	call->stats[LINPHONE_CALL_STATS_VIDEO].upload_bandwidth=(vs!=NULL) ? (media_stream_get_up_bw(vs)*1e-3) : 0;
-	ms_message("bandwidth usage for call [%p]: audio=[d=%.1f,u=%.1f] video=[d=%.1f,u=%.1f] kbit/sec",
+	bool_t as_active =  as ? (media_stream_get_state(as) == MSStreamStarted) : FALSE;
+	bool_t vs_active =  vs ? (media_stream_get_state(vs) == MSStreamStarted) : FALSE;
+	
+	call->stats[LINPHONE_CALL_STATS_AUDIO].download_bandwidth=(as_active) ? (media_stream_get_down_bw(as)*1e-3) : 0;
+	call->stats[LINPHONE_CALL_STATS_AUDIO].upload_bandwidth=(as_active) ? (media_stream_get_up_bw(as)*1e-3) : 0;
+	call->stats[LINPHONE_CALL_STATS_VIDEO].download_bandwidth=(vs_active) ? (media_stream_get_down_bw(vs)*1e-3) : 0;
+	call->stats[LINPHONE_CALL_STATS_VIDEO].upload_bandwidth=(vs_active) ? (media_stream_get_up_bw(vs)*1e-3) : 0;
+	call->stats[LINPHONE_CALL_STATS_AUDIO].rtcp_download_bandwidth=(as_active) ? (media_stream_get_rtcp_down_bw(as)*1e-3) : 0;
+	call->stats[LINPHONE_CALL_STATS_AUDIO].rtcp_upload_bandwidth=(as_active) ? (media_stream_get_rtcp_up_bw(as)*1e-3) : 0;
+	call->stats[LINPHONE_CALL_STATS_VIDEO].rtcp_download_bandwidth=(vs_active) ? (media_stream_get_rtcp_down_bw(vs)*1e-3) : 0;
+	call->stats[LINPHONE_CALL_STATS_VIDEO].rtcp_upload_bandwidth=(vs_active) ? (media_stream_get_rtcp_up_bw(vs)*1e-3) : 0;
+
+	ms_message("Bandwidth usage for call [%p]: audio[ rtp]=[d=%.1f,u=%.1f], video[ rtp]=[d=%.1f,u=%.1f] kbit/sec",
 		call,
 		call->stats[LINPHONE_CALL_STATS_AUDIO].download_bandwidth,
 		call->stats[LINPHONE_CALL_STATS_AUDIO].upload_bandwidth ,
 		call->stats[LINPHONE_CALL_STATS_VIDEO].download_bandwidth,
 		call->stats[LINPHONE_CALL_STATS_VIDEO].upload_bandwidth
 	);
+	ms_message("                                             [rtcp]=[d=%.1f,u=%.1f], video[rtcp]=[d=%.1f,u=%.1f] kbit/sec",
+		call->stats[LINPHONE_CALL_STATS_AUDIO].rtcp_download_bandwidth,
+		call->stats[LINPHONE_CALL_STATS_AUDIO].rtcp_upload_bandwidth ,
+		call->stats[LINPHONE_CALL_STATS_VIDEO].rtcp_download_bandwidth,
+		call->stats[LINPHONE_CALL_STATS_VIDEO].rtcp_upload_bandwidth
+	);
 }
 
 static void linphone_core_disconnected(LinphoneCore *lc, LinphoneCall *call){
-	char temp[256];
+	char temp[256]={0};
 	char *from=NULL;
-	if(call)
-		from = linphone_call_get_remote_address_as_string(call);
-	if (from)
-	{
-		snprintf(temp,sizeof(temp),"Remote end %s seems to have disconnected, the call is going to be closed.",from);
-		ms_free(from);
-	}
-	else
-	{
-		snprintf(temp,sizeof(temp),"Remote end seems to have disconnected, the call is going to be closed.");
-	}
-	ms_message("On call [%p] %s",call,temp);
-	if (lc->vtable.display_warning!=NULL)
-		lc->vtable.display_warning(lc,temp);
+
+	from = linphone_call_get_remote_address_as_string(call);
+	snprintf(temp,sizeof(temp)-1,"Remote end %s seems to have disconnected, the call is going to be closed.",from ? from : "");
+	if (from) ms_free(from);
+
+	ms_message("On call [%p]: %s",call,temp);
+	linphone_core_notify_display_warning(lc,temp);
 	linphone_core_terminate_call(lc,call);
 	linphone_core_play_named_tone(lc,LinphoneToneCallLost);
 }
@@ -2710,17 +2829,16 @@ static void handle_ice_events(LinphoneCall *call, OrtpEvent *ev){
 	int ping_time;
 
 	if (evt == ORTP_EVENT_ICE_SESSION_PROCESSING_FINISHED) {
-		LinphoneCallParams params;
-		_linphone_call_params_copy(&params,&call->current_params);
-		if (call->params.media_encryption == LinphoneMediaEncryptionZRTP) {
+		LinphoneCallParams *params = linphone_call_params_copy(call->current_params);
+		if (call->params->media_encryption == LinphoneMediaEncryptionZRTP) {
 			/* preserve media encryption param because at that time ZRTP negociation may still be ongoing*/
-			params.media_encryption=call->params.media_encryption;
+			params->media_encryption=call->params->media_encryption;
 		}
 		switch (ice_session_state(call->ice_session)) {
 			case IS_Completed:
 				ice_session_select_candidates(call->ice_session);
 				if (ice_session_role(call->ice_session) == IR_Controlling) {
-					linphone_core_update_call(call->core, call, &params);
+					linphone_core_update_call(call->core, call, params);
 				}
 				break;
 			case IS_Failed:
@@ -2728,7 +2846,7 @@ static void handle_ice_events(LinphoneCall *call, OrtpEvent *ev){
 					ice_session_select_candidates(call->ice_session);
 					if (ice_session_role(call->ice_session) == IR_Controlling) {
 						/* At least one ICE session has succeeded, so perform a call update. */
-						linphone_core_update_call(call->core, call, &params);
+						linphone_core_update_call(call->core, call, params);
 					}
 				}
 				break;
@@ -2736,6 +2854,7 @@ static void handle_ice_events(LinphoneCall *call, OrtpEvent *ev){
 				break;
 		}
 		linphone_core_update_ice_state_in_call_stats(call);
+		linphone_call_params_unref(params);
 	} else if (evt == ORTP_EVENT_ICE_GATHERING_FINISHED) {
 
 		if (evd->info.ice_processing_successful==TRUE) {
@@ -2755,7 +2874,7 @@ static void handle_ice_events(LinphoneCall *call, OrtpEvent *ev){
 				linphone_core_start_update_call(call->core, call);
 				break;
 			case LinphoneCallUpdatedByRemote:
-				linphone_core_start_accept_call_update(call->core, call);
+				linphone_core_start_accept_call_update(call->core, call,call->prevstate,linphone_call_state_to_string(call->prevstate));
 				break;
 			case LinphoneCallOutgoingInit:
 				linphone_call_stop_media_streams_for_ice_gathering(call);
@@ -2763,6 +2882,8 @@ static void handle_ice_events(LinphoneCall *call, OrtpEvent *ev){
 				break;
 			case LinphoneCallIdle:
 				linphone_call_stop_media_streams_for_ice_gathering(call);
+				linphone_call_update_local_media_description_from_ice_or_upnp(call);
+				sal_call_set_local_media_description(call->op,call->localdesc);
 				linphone_core_notify_incoming_call(call->core, call);
 				break;
 			default:
@@ -2770,13 +2891,13 @@ static void handle_ice_events(LinphoneCall *call, OrtpEvent *ev){
 		}
 	} else if (evt == ORTP_EVENT_ICE_LOSING_PAIRS_COMPLETED) {
 		if (call->state==LinphoneCallUpdatedByRemote){
-			linphone_core_start_accept_call_update(call->core, call);
+			linphone_core_start_accept_call_update(call->core, call,call->prevstate,linphone_call_state_to_string(call->prevstate));
 			linphone_core_update_ice_state_in_call_stats(call);
 		}
 	} else if (evt == ORTP_EVENT_ICE_RESTART_NEEDED) {
 		ice_session_restart(call->ice_session);
 		ice_session_set_role(call->ice_session, IR_Controlling);
-		linphone_core_update_call(call->core, call, &call->current_params);
+		linphone_core_update_call(call->core, call, call->current_params);
 	}
 }
 
@@ -2805,13 +2926,23 @@ void linphone_call_stats_fill(LinphoneCallStats *stats, MediaStream *ms, OrtpEve
 	}
 }
 
+void linphone_call_stats_uninit(LinphoneCallStats *stats){
+	if (stats->received_rtcp) {
+		freemsg(stats->received_rtcp);
+		stats->received_rtcp=NULL;
+	}
+	if (stats->sent_rtcp){
+		freemsg(stats->sent_rtcp);
+		stats->sent_rtcp=NULL;
+	}
+}
+
 void linphone_call_notify_stats_updated(LinphoneCall *call, int stream_index){
 	LinphoneCallStats *stats=&call->stats[stream_index];
 	LinphoneCore *lc=call->core;
 	if (stats->updated){
-		linphone_reporting_call_stats_updated(call, stream_index);
-		if (lc->vtable.call_stats_updated)
-			lc->vtable.call_stats_updated(lc, call, stats);
+		linphone_reporting_on_rtcp_update(call, stream_index);
+		linphone_core_notify_call_stats_updated(lc, call, stats);
 		stats->updated = 0;
 	}
 }
@@ -2889,7 +3020,8 @@ void linphone_call_background_tasks(LinphoneCall *call, bool_t one_second_elapse
 
 	linphone_call_handle_stream_events(call,0);
 	linphone_call_handle_stream_events(call,1);
-	if (call->state==LinphoneCallStreamsRunning && one_second_elapsed && call->audiostream!=NULL && disconnect_timeout>0 )
+	if (call->state==LinphoneCallStreamsRunning && one_second_elapsed && call->audiostream!=NULL
+		&& call->audiostream->ms.state==MSStreamStarted && disconnect_timeout>0 )
 		disconnected=!audio_stream_alive(call->audiostream,disconnect_timeout);
 	if (disconnected)
 		linphone_core_disconnected(call->core,call);
@@ -2898,7 +3030,7 @@ void linphone_call_background_tasks(LinphoneCall *call, bool_t one_second_elapse
 void linphone_call_log_completed(LinphoneCall *call){
 	LinphoneCore *lc=call->core;
 
-	call->log->duration=time(NULL)-call->log->start_date_time;
+	call->log->duration=linphone_call_get_duration(call); /*store duration since connected*/
 
 	if (call->log->status==LinphoneCallMissed){
 		char *info;
@@ -2906,11 +3038,10 @@ void linphone_call_log_completed(LinphoneCall *call){
 		info=ortp_strdup_printf(ngettext("You have missed %i call.",
 										 "You have missed %i calls.", lc->missed_calls),
 								lc->missed_calls);
-		if (lc->vtable.display_status!=NULL)
-			lc->vtable.display_status(lc,info);
+		linphone_core_notify_display_status(lc,info);
 		ms_free(info);
 	}
-	lc->call_logs=ms_list_prepend(lc->call_logs,(void *)call->log);
+	lc->call_logs=ms_list_prepend(lc->call_logs,linphone_call_log_ref(call->log));
 	if (ms_list_size(lc->call_logs)>lc->max_call_logs){
 		MSList *elem,*prevelem=NULL;
 		/*find the last element*/
@@ -2918,12 +3049,10 @@ void linphone_call_log_completed(LinphoneCall *call){
 			prevelem=elem;
 		}
 		elem=prevelem;
-		linphone_call_log_destroy((LinphoneCallLog*)elem->data);
+		linphone_call_log_unref((LinphoneCallLog*)elem->data);
 		lc->call_logs=ms_list_remove_link(lc->call_logs,elem);
 	}
-	if (lc->vtable.call_log_updated!=NULL){
-		lc->vtable.call_log_updated(lc,call->log);
-	}
+	linphone_core_notify_call_log_updated(lc,call->log);
 	call_logs_write_to_config_file(lc);
 }
 
@@ -2939,16 +3068,15 @@ void linphone_call_set_transfer_state(LinphoneCall* call, LinphoneCallState stat
 	if (state != call->transfer_state) {
 		LinphoneCore* lc = call->core;
 		ms_message("Transfer state for call [%p] changed  from [%s] to [%s]",call
-																			,linphone_call_state_to_string(call->transfer_state)
-																			,linphone_call_state_to_string(state));
+						,linphone_call_state_to_string(call->transfer_state)
+						,linphone_call_state_to_string(state));
 		call->transfer_state = state;
-		if (lc->vtable.transfer_state_changed)
-			lc->vtable.transfer_state_changed(lc, call, state);
+		linphone_core_notify_transfer_state_changed(lc, call, state);
 	}
 }
 
 bool_t linphone_call_is_in_conference(const LinphoneCall *call) {
-	return call->params.in_conference;
+	return call->params->in_conference;
 }
 
 /**
@@ -2982,7 +3110,7 @@ void linphone_call_zoom_video(LinphoneCall* call, float zoom_factor, float* cx, 
 		zoom[0] = zoom_factor;
 		zoom[1] = *cx;
 		zoom[2] = *cy;
-			ms_filter_call_method(vstream->output, MS_VIDEO_DISPLAY_ZOOM, &zoom);
+		ms_filter_call_method(vstream->output, MS_VIDEO_DISPLAY_ZOOM, &zoom);
 	}else ms_warning("Could not apply zoom: video output wasn't activated.");
 }
 
@@ -2992,7 +3120,7 @@ static LinphoneAddress *get_fixed_contact(LinphoneCore *lc, LinphoneCall *call ,
 	const char *localip=call->localip;
 
 	/* first use user's supplied ip address if asked*/
-	if (linphone_core_get_firewall_policy(lc)==LinphonePolicyUseNatAddress){
+	if (_linphone_core_get_firewall_policy(lc)==LinphonePolicyUseNatAddress){
 		ctt=linphone_core_get_primary_contact_parsed(lc);
 		linphone_address_set_domain(ctt,linphone_core_get_nat_address_resolved(lc));
 		ret=ctt;
@@ -3011,7 +3139,7 @@ static LinphoneAddress *get_fixed_contact(LinphoneCore *lc, LinphoneCall *call ,
 	} else {
 		ctt=linphone_core_get_primary_contact_parsed(lc);
 		if (ctt!=NULL){
-			/*otherwise use supllied localip*/
+			/*otherwise use supplied localip*/
 			linphone_address_set_domain(ctt,localip);
 			linphone_address_set_port(ctt,linphone_core_get_sip_port(lc));
 			ms_message("Contact has been fixed using local ip"/* to %s",ret*/);
@@ -3036,5 +3164,91 @@ void linphone_call_set_contact_op(LinphoneCall* call) {
 		sal_address_set_transport((SalAddress*)contact,tport);
 		sal_op_set_contact_address(call->op, contact);
 		linphone_address_destroy(contact);
+	}
+}
+
+LinphonePlayer *linphone_call_get_player(LinphoneCall *call){
+	if (call->player==NULL)
+		call->player=linphone_call_build_player(call);
+	return call->player;
+}
+
+void linphone_call_set_new_params(LinphoneCall *call, const LinphoneCallParams *params){
+	LinphoneCallParams *cp=NULL;
+	if (params) cp=linphone_call_params_copy(params);
+	if (call->params) linphone_call_params_unref(call->params);
+	call->params=cp;
+}
+
+static int send_dtmf_handler(void *data, unsigned int revents){
+	LinphoneCall *call = (LinphoneCall*)data;
+	/*By default we send DTMF RFC2833 if we do not have enabled SIP_INFO but we can also send RFC2833 and SIP_INFO*/
+	if (linphone_core_get_use_rfc2833_for_dtmf(call->core)!=0 || linphone_core_get_use_info_for_dtmf(call->core)==0)
+	{
+		/* In Band DTMF */
+		if (call->audiostream!=NULL){
+			audio_stream_send_dtmf(call->audiostream,*call->dtmf_sequence);
+		}
+		else
+		{
+			ms_error("Cannot send RFC2833 DTMF when we are not in communication.");
+			return FALSE;
+		}
+	}
+	if (linphone_core_get_use_info_for_dtmf(call->core)!=0){
+		/* Out of Band DTMF (use INFO method) */
+		sal_call_send_dtmf(call->op,*call->dtmf_sequence);
+	}
+
+	/*this check is needed because linphone_call_send_dtmf does not set the timer since its a single character*/
+	if (call->dtmfs_timer!=NULL) {
+		memmove(call->dtmf_sequence, call->dtmf_sequence+1, strlen(call->dtmf_sequence));
+	}
+	/* continue only if the dtmf sequence is not empty*/
+	if (call->dtmf_sequence!=NULL&&*call->dtmf_sequence!='\0') {
+		return TRUE;
+	} else {
+		linphone_call_cancel_dtmfs(call);
+		return FALSE;
+	}
+}
+int linphone_call_send_dtmf(LinphoneCall *call,char dtmf){
+	if (call==NULL){
+		ms_warning("linphone_call_send_dtmf(): invalid call, canceling DTMF.");
+		return -1;
+	}
+	call->dtmf_sequence = &dtmf;
+	send_dtmf_handler(call,0);
+	call->dtmf_sequence = NULL;
+	return 0;
+}
+
+int linphone_call_send_dtmfs(LinphoneCall *call,char *dtmfs) {
+	if (call==NULL){
+		ms_warning("linphone_call_send_dtmfs(): invalid call, canceling DTMF sequence.");
+		return -1;
+	}
+	if (call->dtmfs_timer!=NULL){
+		ms_warning("linphone_call_send_dtmfs(): a DTMF sequence is already in place, canceling DTMF sequence.");
+		return -2;
+	}
+	if (dtmfs != NULL) {
+		int delay_ms = lp_config_get_int(call->core->config,"net","dtmf_delay_ms",200);
+		call->dtmf_sequence = ms_strdup(dtmfs);
+		call->dtmfs_timer = sal_create_timer(call->core->sal, send_dtmf_handler, call, delay_ms, "DTMF sequence timer");
+	}
+	return 0;
+}
+
+void linphone_call_cancel_dtmfs(LinphoneCall *call) {
+	/*nothing to do*/
+	if (!call || !call->dtmfs_timer) return;
+
+	sal_cancel_timer(call->core->sal, call->dtmfs_timer);
+	belle_sip_object_unref(call->dtmfs_timer);
+	call->dtmfs_timer = NULL;
+	if (call->dtmf_sequence != NULL) {
+		ms_free(call->dtmf_sequence);
+		call->dtmf_sequence = NULL;
 	}
 }

@@ -65,14 +65,18 @@ typedef enum {
 	SalTransportUDP, /*UDP*/
 	SalTransportTCP, /*TCP*/
 	SalTransportTLS, /*TLS*/
-	SalTransportDTLS /*DTLS*/
+	SalTransportDTLS, /*DTLS*/
 }SalTransport;
 
-#define SAL_MEDIA_DESCRIPTION_UNCHANGED		0x00
-#define SAL_MEDIA_DESCRIPTION_NETWORK_CHANGED	0x01
-#define SAL_MEDIA_DESCRIPTION_CODEC_CHANGED	0x02
-#define SAL_MEDIA_DESCRIPTION_CRYPTO_CHANGED	0x04
-#define SAL_MEDIA_DESCRIPTION_CHANGED		(SAL_MEDIA_DESCRIPTION_NETWORK_CHANGED | SAL_MEDIA_DESCRIPTION_CODEC_CHANGED | SAL_MEDIA_DESCRIPTION_CRYPTO_CHANGED)
+#define SAL_MEDIA_DESCRIPTION_UNCHANGED			0x00
+#define SAL_MEDIA_DESCRIPTION_NETWORK_CHANGED		(1)
+#define SAL_MEDIA_DESCRIPTION_CODEC_CHANGED		(1<<1)
+#define SAL_MEDIA_DESCRIPTION_CRYPTO_KEYS_CHANGED	(1<<2)
+#define SAL_MEDIA_DESCRIPTION_CRYPTO_POLICY_CHANGED	(1<<3)
+#define SAL_MEDIA_DESCRIPTION_STREAMS_CHANGED		(1<<4)
+
+#define SAL_MEDIA_DESCRIPTION_CHANGED		(SAL_MEDIA_DESCRIPTION_NETWORK_CHANGED | SAL_MEDIA_DESCRIPTION_CODEC_CHANGED |\
+						SAL_MEDIA_DESCRIPTION_CRYPTO_KEYS_CHANGED |SAL_MEDIA_DESCRIPTION_CRYPTO_POLICY_CHANGED | SAL_MEDIA_DESCRIPTION_STREAMS_CHANGED)
 
 const char* sal_transport_to_string(SalTransport transport);
 SalTransport sal_transport_parse(const char*);
@@ -106,6 +110,9 @@ void sal_address_set_transport_name(SalAddress* addr,const char* transport);
 void sal_address_set_params(SalAddress *addr, const char *params);
 void sal_address_set_uri_params(SalAddress *addr, const char *params);
 bool_t sal_address_is_ipv6(SalAddress *addr);
+void sal_address_set_password(SalAddress *addr, const char *passwd);
+const char *sal_address_get_password(const SalAddress *addr);
+void sal_address_set_header(SalAddress *addr, const char *header_name, const char *header_value);
 
 Sal * sal_init();
 void sal_uninit(Sal* sal);
@@ -123,6 +130,8 @@ const char* sal_stream_type_to_string(SalStreamType type);
 typedef enum{
 	SalProtoRtpAvp,
 	SalProtoRtpSavp,
+	SalProtoRtpAvpf,
+	SalProtoRtpSavpf,
 	SalProtoOther
 }SalMediaProto;
 const char* sal_media_proto_to_string(SalMediaProto type);
@@ -213,8 +222,7 @@ typedef struct SalMediaDescription{
 	char name[64];
 	char addr[64];
 	char username[64];
-	int n_active_streams;
-	int n_total_streams;
+	int nb_streams;
 	int bandwidth;
 	unsigned int session_ver;
 	unsigned int session_id;
@@ -233,6 +241,7 @@ typedef struct SalMessage{
 	const char *text;
 	const char *url;
 	const char *message_id;
+	const char *content_type;
 	time_t time;
 }SalMessage;
 
@@ -251,7 +260,17 @@ int sal_media_description_equals(const SalMediaDescription *md1, const SalMediaD
 bool_t sal_media_description_has_dir(const SalMediaDescription *md, SalStreamDir dir);
 SalStreamDescription *sal_media_description_find_stream(SalMediaDescription *md,
     SalMediaProto proto, SalStreamType type);
+unsigned int sal_media_description_nb_active_streams_of_type(SalMediaDescription *md, SalStreamType type);
+SalStreamDescription * sal_media_description_get_active_stream_of_type(SalMediaDescription *md, SalStreamType type, unsigned int idx);
+SalStreamDescription * sal_media_description_find_secure_stream_of_type(SalMediaDescription *md, SalStreamType type);
+SalStreamDescription * sal_media_description_find_best_stream(SalMediaDescription *md, SalStreamType type);
 void sal_media_description_set_dir(SalMediaDescription *md, SalStreamDir stream_dir);
+bool_t sal_stream_description_active(const SalStreamDescription *sd);
+bool_t sal_stream_description_has_avpf(const SalStreamDescription *sd);
+bool_t sal_stream_description_has_srtp(const SalStreamDescription *sd);
+bool_t sal_media_description_has_avpf(const SalMediaDescription *md);
+bool_t sal_media_description_has_srtp(const SalMediaDescription *md);
+int sal_media_description_get_nb_active_streams(const SalMediaDescription *md);
 
 
 /*this structure must be at the first byte of the SalOp structure defined by implementors*/
@@ -273,6 +292,7 @@ typedef struct SalOpBase{
 	SalMediaDescription *remote_media;
 	void *user_pointer;
 	const char* call_id;
+	char* realm;
 	SalAddress* service_route; /*as defined by rfc3608, might be a list*/
 	SalCustomHeader *sent_custom_headers;
 	SalCustomHeader *recv_custom_headers;
@@ -400,7 +420,7 @@ typedef void (*SalOnCallReceived)(SalOp *op);
 typedef void (*SalOnCallRinging)(SalOp *op);
 typedef void (*SalOnCallAccepted)(SalOp *op);
 typedef void (*SalOnCallAck)(SalOp *op);
-typedef void (*SalOnCallUpdating)(SalOp *op);/*< Called when a reINVITE/UPDATE is received*/
+typedef void (*SalOnCallUpdating)(SalOp *op, bool_t is_update);/*< Called when a reINVITE/UPDATE is received*/
 typedef void (*SalOnCallTerminated)(SalOp *op, const char *from);
 typedef void (*SalOnCallFailure)(SalOp *op);
 typedef void (*SalOnCallReleased)(SalOp *salop);
@@ -499,20 +519,27 @@ void sal_signing_key_delete(SalSigningKey *key);
 
 
 void sal_set_callbacks(Sal *ctx, const SalCallbacks *cbs);
-int sal_listen_port(Sal *ctx, const char *addr, int port, SalTransport tr, int is_secure);
+int sal_listen_port(Sal *ctx, const char *addr, int port, SalTransport tr, int is_tunneled);
 int sal_get_listening_port(Sal *ctx, SalTransport tr);
 int sal_unlisten_ports(Sal *ctx);
 int sal_transport_available(Sal *ctx, SalTransport t);
 void sal_set_dscp(Sal *ctx, int dscp);
+void sal_set_supported_tags(Sal *ctx, const char* tags);
+void sal_add_supported_tag(Sal *ctx, const char* tag);
+void sal_remove_supported_tag(Sal *ctx, const char* tag);
+const char *sal_get_supported_tags(Sal *ctx);
 int sal_reset_transports(Sal *ctx);
 ortp_socket_t sal_get_socket(Sal *ctx);
 void sal_set_user_agent(Sal *ctx, const char *user_agent);
+const char* sal_get_user_agent(Sal *ctx);
 void sal_append_stack_string_to_user_agent(Sal *ctx);
 /*keepalive period in ms*/
 void sal_set_keepalive_period(Sal *ctx,unsigned int value);
 void sal_use_tcp_tls_keepalive(Sal *ctx, bool_t enabled);
-int sal_enable_tunnel(Sal *ctx, void *tunnelclient);
-void sal_disable_tunnel(Sal *ctx);
+int sal_set_tunnel(Sal *ctx, void *tunnelclient);
+/*Default value is true*/
+void sal_enable_sip_update_method(Sal *ctx,bool_t value);
+
 /**
  * returns keepalive period in ms
  * 0 desactiaved
@@ -529,7 +556,7 @@ void sal_verify_server_certificates(Sal *ctx, bool_t verify);
 void sal_verify_server_cn(Sal *ctx, bool_t verify);
 void sal_set_uuid(Sal*ctx, const char *uuid);
 int sal_create_uuid(Sal*ctx, char *uuid, size_t len);
-void sal_enable_test_features(Sal*ctx, bool_t enabled);
+LINPHONE_PUBLIC void sal_enable_test_features(Sal*ctx, bool_t enabled);
 void sal_use_no_initial_route(Sal *ctx, bool_t enabled);
 
 int sal_iterate(Sal *sal);
@@ -544,6 +571,7 @@ void sal_op_set_contact_address(SalOp *op, const SalAddress* address);
 void sal_op_set_route(SalOp *op, const char *route);
 void sal_op_set_route_address(SalOp *op, const SalAddress* address);
 void sal_op_add_route_address(SalOp *op, const SalAddress* address);
+void sal_op_set_realm(SalOp *op, const char *realm);
 void sal_op_set_from(SalOp *op, const char *from);
 void sal_op_set_from_address(SalOp *op, const SalAddress *from);
 void sal_op_set_to(SalOp *op, const char *to);
@@ -597,7 +625,7 @@ int sal_call_notify_ringing(SalOp *h, bool_t early_media);
 /*accept an incoming call or, during a call accept a reINVITE*/
 int sal_call_accept(SalOp*h);
 int sal_call_decline(SalOp *h, SalReason reason, const char *redirection /*optional*/);
-int sal_call_update(SalOp *h, const char *subject);
+int sal_call_update(SalOp *h, const char *subject, bool_t no_user_consent);
 SalMediaDescription * sal_call_get_remote_media_description(SalOp *h);
 SalMediaDescription * sal_call_get_final_media_description(SalOp *h);
 int sal_call_refer(SalOp *h, const char *refer_to);
@@ -613,6 +641,12 @@ bool_t sal_call_autoanswer_asked(SalOp *op);
 void sal_call_send_vfu_request(SalOp *h);
 int sal_call_is_offerer(const SalOp *h);
 int sal_call_notify_refer_state(SalOp *h, SalOp *newcall);
+/* Call test API */
+/*willingly fails to parse SDP from received packets (INVITE and/or ACK) if value=true */
+/* First version: for all new SalOp created (eg. each incoming or outgoing call). Do not forget to reset previous value when you are done!*/
+void sal_default_enable_sdp_removal(Sal* h, bool_t enable) ;
+/* Second version: for a specific call*/
+void sal_call_enable_sdp_removal(SalOp *h, bool_t enable) ;
 
 /*Registration*/
 int sal_register(SalOp *op, const char *proxy, const char *from, int expires);
@@ -724,6 +758,7 @@ LINPHONE_PUBLIC bool_t sal_dns_srv_enabled(const Sal *sal);
 LINPHONE_PUBLIC void sal_set_dns_user_hosts_file(Sal *sal, const char *hosts_file);
 LINPHONE_PUBLIC const char *sal_get_dns_user_hosts_file(const Sal *sal);
 unsigned int sal_get_random(void);
+char *sal_get_random_token(int size);
 unsigned char * sal_get_random_bytes(unsigned char *ret, size_t size);
 belle_sip_source_t * sal_create_timer(Sal *sal, belle_sip_source_func_t func, void *data, unsigned int timeout_value_ms, const char* timer_name);
 void sal_cancel_timer(Sal *sal, belle_sip_source_t *timer);
@@ -733,5 +768,5 @@ int sal_body_has_type(const SalBody *body, const char *type, const char *subtype
 int sal_lines_get_value(const char *data, const char *key, char *value, size_t value_size);
 
 belle_sip_stack_t *sal_get_belle_sip_stack(Sal *sal);
-
+char* sal_op_get_public_uri(SalOp *sal);
 #endif

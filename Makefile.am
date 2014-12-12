@@ -51,7 +51,7 @@ PACKAGE_BUNDLE_FILE=$(top_srcdir)/build/macos/$(PACKAGE).bundle
 EXTRA_DIST =		BUGS  \
 			README.arm \
 			README.mingw \
-			README.macos \
+			README.macos.md \
 			autogen.sh \
 			linphone.spec \
 			linphone.spec.in \
@@ -172,7 +172,7 @@ filelist: zip
 setup.exe: filelist
 	cp $(ISS_SCRIPT) $(INSTALLDIR_WITH_PREFIX)/.
 	cd $(INSTALLDIR_WITH_PREFIX) && \
-	$(ISCC) $(ISS_SCRIPT) 
+	$(ISCC) $(ISS_SCRIPT)
 	mv $(INSTALLDIR_WITH_PREFIX)/Output/setup.exe $(PACKAGE)-$(VERSION)-setup.exe
 	rm -rf $(INSTALLDIR_WITH_PREFIX)/Output
 	rm -f $(INSTALLDIR_WITH_PREFIX)/$(PACKAGE_WIN32_FILELIST)
@@ -205,7 +205,8 @@ MACAPPZIP=$(PACKAGE)-$(VERSION).app.zip
 MACAPPDMG=$(PACKAGE)-$(VERSION).dmg
 BUNDLEPREFIX=./
 BUNDLEDIR=$(BUNDLEPREFIX)$(MACAPPNAME)
-
+#a path prefix where additional libs can be cherry-picked by the bundler.
+LINPHONE_ADDITIONAL_DEPENDENCIES_PREFIX=/usr/local
 
 bundle:
 	rm -rf $(INSTALLDIR)
@@ -215,6 +216,7 @@ bundle:
 	LINPHONE_INSTALL_PREFIX=$(INSTALLDIR_WITH_PREFIX) \
 	LIBLINPHONE_INSTALL_PREFIX=$(INSTALLDIR_WITH_PREFIX) \
 	MS2_PLUGINS_INSTALL_PREFIX=$(prefix) \
+	LINPHONE_ADDITIONAL_DEPENDENCIES_PREFIX=$(LINPHONE_ADDITIONAL_DEPENDENCIES_PREFIX) \
 	gtk-mac-bundler $(PACKAGE_BUNDLE_FILE)
 	printf "[Pango]\nModuleFiles=./etc/pango/pango.modules\n" \
 	> $(BUNDLEDIR)/Contents/Resources/etc/pango/pangorc

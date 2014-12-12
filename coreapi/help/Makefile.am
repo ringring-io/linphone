@@ -1,7 +1,7 @@
 
 EXTRA_DIST=Doxyfile.in doxygen.dox
 
-SOURCES=doxygen.dox $(top_srcdir)/coreapi/help/*.c $(top_srcdir)/coreapi/*.c $(top_srcdir)/coreapi/*.h  
+SOURCES=doxygen.dox $(top_srcdir)/coreapi/help/*.c $(top_srcdir)/coreapi/*.c $(top_srcdir)/coreapi/*.h
 
 
 # html doc
@@ -46,7 +46,7 @@ clean-local:
 
 if ENABLE_TUTORIALS
 
-noinst_PROGRAMS=helloworld registration buddy_status chatroom notify
+noinst_PROGRAMS=helloworld registration buddy_status chatroom notify filetransfer
 
 helloworld_SOURCES=helloworld.c
 LINPHONE_TUTOS=$(helloworld_SOURCES)
@@ -76,9 +76,15 @@ LINPHONE_TUTOS+=$(notify_SOURCES)
 
 notify_LDADD=$(helloworld_LDADD)
 
+filetransfer_SOURCES=filetransfer.c
+LINPHONE_TUTOS+=$(filetransfer_SOURCES)
+
+filetransfer_LDADD=$(helloworld_LDADD)
+
 AM_CFLAGS=\
 	-I$(top_srcdir)/coreapi \
 	$(STRICT_OPTIONS) \
+	$(STRICT_OPTIONS_CC) \
 	-DIN_LINPHONE \
 	$(ORTP_CFLAGS) \
 	$(MEDIASTREAMER_CFLAGS) \
@@ -93,4 +99,4 @@ AM_CFLAGS=\
 tutodir=$(datadir)/tutorials/linphone
 
 tuto_DATA=$(LINPHONE_TUTOS)
-endif 
+endif

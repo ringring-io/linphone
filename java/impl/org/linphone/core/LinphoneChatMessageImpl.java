@@ -1,8 +1,10 @@
 package org.linphone.core;
 
+import java.io.UnsupportedEncodingException;
+
 public class LinphoneChatMessageImpl implements LinphoneChatMessage {
 	protected final long nativePtr;
-	private native String getText(long ptr);
+	private native byte[] getText(long ptr);
 	private native long getPeerAddress(long ptr);
 	private native String getExternalBodyUrl(long ptr);
 	private native void setExternalBodyUrl(long ptr, String url);
@@ -25,7 +27,12 @@ public class LinphoneChatMessageImpl implements LinphoneChatMessage {
 	
 	@Override
 	public String getText() {
-		return getText(nativePtr);
+		try {
+			return new String(getText(nativePtr), "UTF-8");
+		} catch (UnsupportedEncodingException e) {
+			e.printStackTrace();
+		}
+		return null;
 	}
 	
 	@Override
@@ -46,6 +53,12 @@ public class LinphoneChatMessageImpl implements LinphoneChatMessage {
 	@Override
 	public LinphoneAddress getFrom() {
 		return new LinphoneAddressImpl(getFrom(nativePtr),LinphoneAddressImpl.WrapMode.FromConst);
+	}
+	
+	private native long getTo(long ptr);
+	@Override
+	public LinphoneAddress getTo() {
+		return new LinphoneAddressImpl(getTo(nativePtr),LinphoneAddressImpl.WrapMode.FromConst);
 	}
 	
 	private native void addCustomHeader(long nativePtr, String name, String value);
@@ -93,7 +106,38 @@ public class LinphoneChatMessageImpl implements LinphoneChatMessage {
 	public ErrorInfo getErrorInfo() {
 		return new ErrorInfoImpl(getErrorInfo(nativePtr));
 	}
-	protected void finalize(){
+	protected void finalize() throws Throwable{
 		unref(nativePtr);
+		super.finalize();
+	}
+	
+	private native void startFileDownload(long ptr, StateListener listener);
+	@Override
+	public void startFileDownload(StateListener listener) {
+		startFileDownload(nativePtr, listener);
+	}
+	
+	private native Object getFileTransferInformation(long ptr);
+	@Override
+	public LinphoneContent getFileTransferInformation() {
+		return (LinphoneContent) getFileTransferInformation(nativePtr);
+	}
+	
+	private native void setAppData(long ptr, String data);
+	@Override
+	public void setAppData(String data) {
+		setAppData(nativePtr, data);
+	}
+	
+	private native String getAppData(long ptr);
+	@Override
+	public String getAppData() {
+		return getAppData(nativePtr);
+	}
+
+	private native void cancelFileTransfer(long messagePtr);
+	@Override
+	public void cancelFileTransfer() {
+		cancelFileTransfer(nativePtr);
 	}
 }

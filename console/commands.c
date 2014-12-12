@@ -45,7 +45,7 @@
 
 /***************************************************************************
  *
- *  Forward declarations 
+ *  Forward declarations
  *
  ***************************************************************************/
 
@@ -97,6 +97,7 @@ static int lpc_cmd_camera(LinphoneCore *lc, char *args);
 static int lpc_cmd_video_window(LinphoneCore *lc, char *args);
 static int lpc_cmd_preview_window(LinphoneCore *lc, char *args);
 static int lpc_cmd_snapshot(LinphoneCore *lc, char *args);
+static int lpc_cmd_preview_snapshot(LinphoneCore *lc, char *args);
 static int lpc_cmd_vfureq(LinphoneCore *lc, char *arg);
 #endif
 static int lpc_cmd_states(LinphoneCore *lc, char *args);
@@ -190,19 +191,19 @@ static LPC_COMMAND commands[] = {
 		"'conference add <call id> : join the call with id 'call id' into the audio conference."
 		"'conference rm <call id> : remove the call with id 'call id' from the audio conference."
 	},
-	{ "mute", lpc_cmd_mute_mic, 
+	{ "mute", lpc_cmd_mute_mic,
 	  "Mute microphone and suspend voice transmission."},
 #ifdef VIDEO_ENABLED
 	{ "camera", lpc_cmd_camera, "Send camera output for current call.",
 		"'camera on'\t: allow sending of local camera video to remote end.\n"
 		"'camera off'\t: disable sending of local camera's video to remote end.\n"},
 #endif
-	{ "unmute", lpc_cmd_unmute_mic, 
+	{ "unmute", lpc_cmd_unmute_mic,
 		  "Unmute microphone and resume voice transmission."},
-	{ "playbackgain", lpc_cmd_playback_gain, 
+	{ "playbackgain", lpc_cmd_playback_gain,
 		  "Adjust playback gain."},
 	{ "duration", lpc_cmd_duration, "Print duration in seconds of the last call.", NULL },
-	
+
 	{ "autoanswer", lpc_cmd_autoanswer, "Show/set auto-answer mode",
 		"'autoanswer'       \t: show current autoanswer mode\n"
 		"'autoanswer enable'\t: enable autoanswer mode\n"
@@ -291,7 +292,7 @@ static LPC_COMMAND advanced_commands[] = {
 	{ "nortp-on-audio-mute", lpc_cmd_rtp_no_xmit_on_audio_mute,
 		  "Set the rtp_no_xmit_on_audio_mute configuration parameter",
 		  "   If set to 1 then rtp transmission will be muted when\n"
-		  "   audio is muted , otherwise rtp is always sent."}, 
+		  "   audio is muted , otherwise rtp is always sent."},
 #ifdef VIDEO_ENABLED
 	{ "vwindow", lpc_cmd_video_window, "Control video display window",
 		"'vwindow show': shows video window\n"
@@ -312,6 +313,9 @@ static LPC_COMMAND advanced_commands[] = {
 	{ "snapshot", lpc_cmd_snapshot, "Take a snapshot of currently received video stream",
 		"'snapshot <file path>': take a snapshot and records it in jpeg format into the supplied path\n"
 	},
+	{ "preview-snapshot", lpc_cmd_preview_snapshot, "Take a snapshot of currently captured video stream",
+		"'preview-snapshot <file path>': take a snapshot and records it in jpeg format into the supplied path\n"
+	},
 	{ "vfureq", lpc_cmd_vfureq, "Request the other side to send VFU for the current call"},
 #endif
 	{ "states", lpc_cmd_states, "Show internal states of liblinphone, registrations and calls, according to linphonecore.h definitions",
@@ -321,11 +325,11 @@ static LPC_COMMAND advanced_commands[] = {
 	},
 	{ "register", lpc_cmd_register, "Register in one line to a proxy" , "register <sip identity> <sip proxy> <password>"},
 	{ "unregister", lpc_cmd_unregister, "Unregister from default proxy", NULL	},
-	{ "status", lpc_cmd_status, "Print various status information", 
+	{ "status", lpc_cmd_status, "Print various status information",
 			"'status register'  \t: print status concerning registration\n"
 			"'status autoanswer'\t: tell whether autoanswer mode is enabled\n"
 			"'status hook'      \t: print hook status\n" },
-	{ "ports", lpc_cmd_ports, "Network ports configuration", 
+	{ "ports", lpc_cmd_ports, "Network ports configuration",
 			"'ports'  \t: prints current used ports.\n"
 			"'ports sip <port number>'\t: Sets the sip port.\n" },
 	{ "param", lpc_cmd_param, "parameter set or read as normally given in .linphonerc",
@@ -365,7 +369,7 @@ static LPC_COMMAND advanced_commands[] = {
 
 /***************************************************************************
  *
- *  Public interface 
+ *  Public interface
  *
  ***************************************************************************/
 
@@ -476,7 +480,7 @@ linphonec_command_generator(const char *text, int state)
 
 /***************************************************************************
  *
- *  Command handlers 
+ *  Command handlers
  *
  ***************************************************************************/
 
@@ -497,7 +501,7 @@ lpc_cmd_help(LinphoneCore *lc, char *arg)
 				commands[i].help);
 			i++;
 		}
-		
+
 		linphonec_out("---------------------------\n");
 		linphonec_out("Type 'help <command>' for more details or\n");
 		linphonec_out("     'help advanced' to list additional commands.\n");
@@ -511,17 +515,17 @@ lpc_cmd_help(LinphoneCore *lc, char *arg)
 		i=0;
 		while (advanced_commands[i].help)
 		{
-			linphonec_out("%10.10s\t%s\n", advanced_commands[i].name,
+			linphonec_out("%20.20s\t%s\n", advanced_commands[i].name,
 				advanced_commands[i].help);
 			i++;
 		}
-		
+
 		linphonec_out("---------------------------\n");
 		linphonec_out("Type 'help <command>' for more details.\n");
 
 		return 1;
 	}
-	
+
 	cmd=lpc_find_command(arg);
 	if ( !cmd )
 	{
@@ -579,7 +583,7 @@ lpc_cmd_call(LinphoneCore *lc, char *args)
 	return 1;
 }
 
-static int 
+static int
 lpc_cmd_calls(LinphoneCore *lc, char *args){
 	const MSList *calls = linphone_core_get_calls(lc);
 	if(calls)
@@ -599,6 +603,7 @@ lpc_cmd_chat(LinphoneCore *lc, char *args)
 	char *arg1 = args;
 	char *arg2 = NULL;
 	char *ptr = args;
+	LinphoneChatRoom *cr;
 
 	if (!args) return 0;
 
@@ -615,7 +620,7 @@ lpc_cmd_chat(LinphoneCore *lc, char *args)
 		/* missing one parameter */
 		return 0;
 	}
-	LinphoneChatRoom *cr = linphone_core_create_chat_room(lc,arg1);
+	cr = linphone_core_create_chat_room(lc,arg1);
 	linphone_chat_room_send_message(cr,arg2);
 	return 1;
 }
@@ -692,7 +697,7 @@ lpc_cmd_terminate(LinphoneCore *lc, char *args)
 		}
 		return 1;
 	}
-	
+
 	if(strcmp(args,"all")==0){
 		linphonec_out("We are going to stop all the calls.\n");
 		linphone_core_terminate_all_calls(lc);
@@ -709,7 +714,7 @@ lpc_cmd_terminate(LinphoneCore *lc, char *args)
 		return 1;
 	}
 	return 0;
-	
+
 }
 
 static int
@@ -852,7 +857,7 @@ lpc_cmd_firewall(LinphoneCore *lc, char *args)
 		{
 			linphone_core_set_firewall_policy(lc,LinphonePolicyNoFirewall);
 		}
-		else if (strcmp(args,"upnp")==0) 
+		else if (strcmp(args,"upnp")==0)
 		{
 			linphone_core_set_firewall_policy(lc,LinphonePolicyUseUpnp);
 		}
@@ -930,7 +935,7 @@ lpc_friend_name(char **args, char **name)
 		*args = ++end;
 	} else {
 		*name = strsep(args, " ");
-		
+
 		if (NULL == *args) { /* Means there was no separator */
 			fprintf(stderr, "Either name or address is missing\n");
 			return 0;
@@ -960,7 +965,7 @@ lpc_cmd_friend(LinphoneCore *lc, char *args)
 		args+=4;
 		if ( ! *args ) return 0;
 		friend_num = strtol(args, NULL, 10);
-#ifndef _WIN32_WCE		
+#ifndef _WIN32_WCE
 		if ( errno == ERANGE ) {
 			linphonec_out("Invalid friend number\n");
 			return 0;
@@ -978,11 +983,11 @@ lpc_cmd_friend(LinphoneCore *lc, char *args)
 		if (!strncmp(args, "all", 3))
 		{
 			friend_num = -1;
-		} 
+		}
 		else
 		{
 			friend_num = strtol(args, NULL, 10);
-#ifndef _WIN32_WCE		
+#ifndef _WIN32_WCE
 			if ( errno == ERANGE ) {
 				linphonec_out("Invalid friend number\n");
 				return 0;
@@ -1411,7 +1416,7 @@ static int lpc_cmd_pause(LinphoneCore *lc, char *args){
 }
 
 static int lpc_cmd_resume(LinphoneCore *lc, char *args){
-	
+
 	if(linphone_core_in_call(lc))
 	{
 		linphonec_out("There is already a call in process pause or stop it first");
@@ -1450,7 +1455,7 @@ static int lpc_cmd_resume(LinphoneCore *lc, char *args){
 		}
 	}
 	return 0;
-    
+
 }
 
 static int lpc_cmd_conference(LinphoneCore *lc, char *args){
@@ -1596,7 +1601,7 @@ linphonec_proxy_add(LinphoneCore *lc)
 	 */
 	if ( enable_register==TRUE )
 	{
-		long int expires=0;
+		int expires=0;
 		while (1)
 		{
 			char *input=linphonec_readline("Specify register expiration time"
@@ -1608,13 +1613,8 @@ linphonec_proxy_add(LinphoneCore *lc)
 				return;
 			}
 
-			expires=strtol(input, (char **)NULL, 10);
-			if ( expires == LONG_MIN || expires == LONG_MAX )
-			{
-				linphonec_out("Invalid value: %s\n", strerror(errno));
-				free(input);
-				continue;
-			}
+			expires=atoi(input);
+			if (expires==0) expires=600;
 
 			linphone_proxy_config_set_expires(cfg, expires);
 			linphonec_out("Expiration: %d seconds\n", linphone_proxy_config_get_expires (cfg));
@@ -1659,7 +1659,7 @@ linphonec_proxy_add(LinphoneCore *lc)
 	}
 
 	/*
-	 * Final confirmation 
+	 * Final confirmation
 	 */
 	while (1)
 	{
@@ -1742,12 +1742,12 @@ linphonec_proxy_list(LinphoneCore *lc)
 	const MSList *proxies;
 	int n;
 	int def=linphone_core_get_default_proxy(lc,NULL);
-	
+
 	proxies=linphone_core_get_proxy_config_list(lc);
 	for(n=0;proxies!=NULL;proxies=ms_list_next(proxies),n++){
 		if (n==def)
 			linphonec_out("****** Proxy %i - this is the default one - *******\n",n);
-		else 
+		else
 			linphonec_out("****** Proxy %i *******\n",n);
 		linphonec_proxy_display((LinphoneProxyConfig*)proxies->data);
 	}
@@ -1789,7 +1789,7 @@ linphonec_friend_display(LinphoneFriend *fr)
 {
 	LinphoneAddress *uri=linphone_address_clone(linphone_friend_get_address(fr));
 	char *str;
-	
+
 	linphonec_out("name: %s\n", linphone_address_get_display_name(uri));
 	linphone_address_set_display_name(uri,NULL);
 	str=linphone_address_as_string(uri);
@@ -1874,7 +1874,7 @@ linphonec_friend_delete(LinphoneCore *lc, int num)
 		}
 	}
 
-	if (-1 == num) 
+	if (-1 == num)
 	{
 		unsigned int i;
 		for (i = 0 ; i < n ; i++)
@@ -1900,7 +1900,7 @@ static int lpc_cmd_register(LinphoneCore *lc, char *args){
 	char passwd[512];
 	LinphoneProxyConfig *cfg;
 	const MSList *elem;
-    
+
 	if (!args)
     	{
     		/* it means that you want to register the default proxy */
@@ -1979,7 +1979,7 @@ static int lpc_cmd_duration(LinphoneCore *lc, char *args){
 static int lpc_cmd_status(LinphoneCore *lc, char *args)
 {
 	LinphoneProxyConfig *cfg;
-	
+
 	if ( ! args ) return 0;
 	linphone_core_get_default_proxy(lc,&cfg);
 	if (strstr(args,"register"))
@@ -2042,7 +2042,7 @@ static int lpc_cmd_status(LinphoneCore *lc, char *args)
 			default:
 				break;
 		}
-		
+
 	}
 	else return 0;
 
@@ -2101,19 +2101,23 @@ static int lpc_cmd_speak(LinphoneCore *lc, char *args){
 	char voice[64];
 	char *sentence;
 	char cl[128];
-	char *wavfile;
+	char wavfile[128]="/tmp/linphonec-espeak-XXXXXX";
 	int status;
 	FILE *file;
-	
+
     if (!args) return 0;
 	memset(voice,0,sizeof(voice));
 	sscanf(args,"%63s",voice);
 	sentence=args+strlen(voice);
 
 #ifdef __APPLE__
-	wavfile=mktemp("/tmp/linphonec-espeak-XXXXXX");
+	mktemp(wavfile);
 #else
-	wavfile=tempnam("/tmp/","linphonec-espeak-");
+	if (mkstemp(wavfile)==-1){
+		ms_error("Could not create temporary filename: %s", strerror(errno));
+		linphonec_out("An error occured, please consult logs for details.");
+		return 1;
+	}
 #endif
 
 	snprintf(cl,sizeof(cl),"espeak -v %s -s 100 -w %s --stdin",voice,wavfile);
@@ -2200,7 +2204,7 @@ static void linphonec_codec_list(int type, LinphoneCore *lc){
 
 	for(;node!=NULL;node=ms_list_next(node)){
 		pt=(PayloadType*)(node->data);
-        linphonec_out("%2d: %s (%d) %s\n", index, pt->mime_type, pt->clock_rate, 
+        linphonec_out("%2d: %s (%d) %s\n", index, pt->mime_type, pt->clock_rate,
 		    linphone_core_payload_type_enabled(lc,pt) ? "enabled" : "disabled");
 		index++;
 	}
@@ -2274,7 +2278,7 @@ static int lpc_cmd_echocancellation(LinphoneCore *lc, char *args){
         if (arg2 != 0) {
             n = sscanf(arg2, "%d %d %d", &delay, &tail_len, &frame_size);
 
-            if (n == 1) {   
+            if (n == 1) {
                 lp_config_set_int(config,"sound","ec_delay",delay);
             }
             else if (n == 2) {
@@ -2292,11 +2296,11 @@ static int lpc_cmd_echocancellation(LinphoneCore *lc, char *args){
         linphone_core_enable_echo_cancellation(lc,0);
     }
     else if (strcmp(arg1,"show")==0){
-        linphonec_out("echo cancellation is %s; delay %d, tail length %d, frame size %d\n", 
+        linphonec_out("echo cancellation is %s; delay %d, tail length %d, frame size %d\n",
             linphone_core_echo_cancellation_enabled(lc) ? "on" : "off",
             lp_config_get_int(config,"sound","ec_delay",0),
             lp_config_get_int(config,"sound","ec_tail_len",0),
-            lp_config_get_int(config,"sound","ec_framesize",0));        
+            lp_config_get_int(config,"sound","ec_framesize",0));
     }
     else {
         return 0;
@@ -2346,7 +2350,7 @@ static int lpc_cmd_rtp_no_xmit_on_audio_mute(LinphoneCore *lc, char *args)
 		if(strstr(args,"1"))rtp_xmit_off=TRUE;
 		if(linphone_core_get_current_call (lc)==NULL)
 			linphone_core_set_rtp_no_xmit_on_audio_mute(lc,rtp_xmit_off);
-		else 
+		else
 			linphonec_out("nortp-on-audio-mute: call in progress - cannot change state\n");
 	}
 	rtp_xmit_off=linphone_core_get_rtp_no_xmit_on_audio_mute(lc);
@@ -2433,8 +2437,9 @@ static void lpc_display_call_states(LinphoneCore *lc){
 	}else{
 		for(;elem!=NULL;elem=elem->next){
 			const char *flag;
+			bool_t in_conference;
 			call=(LinphoneCall*)elem->data;
-			bool_t in_conference=linphone_call_params_local_conference_mode(linphone_call_get_current_params(call));
+			in_conference=linphone_call_params_get_local_conference_mode(linphone_call_get_current_params(call));
 			tmp=linphone_call_get_remote_address_as_string (call);
 			flag=in_conference ? "conferencing" : "";
 			flag=linphone_call_has_transfer_pending(call) ? "transfer pending" : flag;
@@ -2487,7 +2492,7 @@ static int lpc_cmd_states(LinphoneCore *lc, char *args){
 static int lpc_cmd_camera(LinphoneCore *lc, char *args){
 	LinphoneCall *call=linphone_core_get_current_call(lc);
 	bool_t activated=FALSE;
-	
+
 	if (linphone_core_video_enabled (lc)==FALSE){
 		linphonec_out("Video is disabled, re-run linphonec with -V option.");
 		return 1;
@@ -2540,6 +2545,17 @@ static int lpc_cmd_snapshot(LinphoneCore *lc, char *args){
 	if (call!=NULL){
 		linphone_call_take_video_snapshot(call,args);
 		linphonec_out("Taking video snapshot in file %s\n", args);
+	}else linphonec_out("There is no active call.\n");
+	return 1;
+}
+
+static int lpc_cmd_preview_snapshot(LinphoneCore *lc, char *args){
+	LinphoneCall *call;
+	if (!args) return 0;
+	call=linphone_core_get_current_call(lc);
+	if (call!=NULL){
+		linphone_call_take_preview_snapshot(call,args);
+		linphonec_out("Taking video preview snapshot in file %s\n", args);
 	}else linphonec_out("There is no active call.\n");
 	return 1;
 }

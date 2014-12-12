@@ -25,10 +25,9 @@
 #include "CUnit/CUCurses.h"
 #endif
 
-#ifdef ANDROID
+extern int liblinphone_tester_use_log_file;
 
-extern void AndroidPrintf(FILE *stream, const char *fmt, ...);
-#define fprintf(file, fmt, ...) AndroidPrintf(file, fmt, ##__VA_ARGS__)
+#ifdef ANDROID
 
 #include <android/log.h>
 #include <jni.h>
@@ -83,6 +82,7 @@ void cunit_android_trace_handler(int level, const char *fmt, va_list args) {
 	jmethodID method = (*env)->GetMethodID(env, cls, "printLog", "(ILjava/lang/String;)V");
 	(*env)->CallVoidMethod(env, current_obj, method, javaLevel, javaString);
 	(*env)->DeleteLocalRef(env,javaString);
+	(*env)->DeleteLocalRef(env,cls);
 }
 
 JNIEXPORT jint JNICALL Java_org_linphone_tester_Tester_run(JNIEnv *env, jobject obj, jobjectArray stringArray) {
@@ -118,8 +118,9 @@ static void liblinphone_tester_qnx_log_handler(OrtpLogLevel lev, const char *fmt
 #endif /* __QNX__ */
 
 
+
 void helper(const char *name) {
-	fprintf(stderr,"%s \t--help\n"
+	liblinphone_tester_fprintf(stderr,"%s --help\n"
 			"\t\t\t--verbose\n"
 			"\t\t\t--silent\n"
 			"\t\t\t--list-suites\n"
@@ -130,6 +131,7 @@ void helper(const char *name) {
 			"\t\t\t--suite <suite name>\n"
 			"\t\t\t--test <test name>\n"
 			"\t\t\t--dns-hosts </etc/hosts -like file to used to override DNS names (default: tester_hosts)>\n"
+			"\t\t\t--log-file <output log file path>\n"
 #if HAVE_CU_CURSES
 			"\t\t\t--curses\n"
 #endif
@@ -147,11 +149,11 @@ return -1;                                                    \
 
 int main (int argc, char *argv[])
 {
-	int i,j;
+	int i;
 	int ret;
 	const char *suite_name=NULL;
 	const char *test_name=NULL;
-
+	FILE* log_file=NULL;
 #if defined(ANDROID)
 	linphone_core_set_log_handler(linphone_android_ortp_log_handler);
 #elif defined(__QNX__)
@@ -189,36 +191,28 @@ int main (int argc, char *argv[])
 			CHECK_ARG("--suite", ++i, argc);
 			suite_name=argv[i];
 		} else if (strcmp(argv[i],"--list-suites")==0){
-			for(j=0;j<liblinphone_tester_nb_test_suites();j++) {
-				suite_name = liblinphone_tester_test_suite_name(j);
-				fprintf(stdout, "%s\n", suite_name);
-			}
+			liblinphone_tester_list_suites();
 			return 0;
 		} else if (strcmp(argv[i],"--list-tests")==0){
 			CHECK_ARG("--list-tests", ++i, argc);
 			suite_name = argv[i];
-			for(j=0;j<liblinphone_tester_nb_tests(suite_name);j++) {
-				test_name = liblinphone_tester_test_name(suite_name, j);
-				fprintf(stdout, "%s\n", test_name);
-			}
+			liblinphone_tester_list_suite_tests(suite_name);
 			return 0;
-		} else {
+		} else if (strcmp(argv[i],"--log-file")==0){
+			CHECK_ARG("--log-file", ++i, argc);
+			log_file=fopen(argv[i],"w");
+			if (!log_file) {
+				ms_fatal("Cannot open file [%s] for writting logs because [%s]",argv[i],strerror(errno));
+			} else {
+				liblinphone_tester_use_log_file=1;
+				liblinphone_tester_fprintf(stdout,"Redirecting traces to file [%s]",argv[i]);
+				linphone_core_set_log_file(log_file);
+			}
+
+		}else {
+			liblinphone_tester_fprintf(stderr, "Unknown option \"%s\"\n", argv[i]); \
 			helper(argv[0]);
 			return -1;
-		}
-	}
-
-	// Check arguments
-	if(suite_name != NULL) {
-		if(liblinphone_tester_test_suite_index(suite_name) == -1) {
-			fprintf(stderr, "Suite \"%s\" not found\n", suite_name);
-			return -1;
-		}
-		if(test_name != NULL) {
-			if(liblinphone_tester_test_index(suite_name, test_name) == -1) {
-				fprintf(stderr, "Test \"%s\" not found\n", test_name);
-				return -1;
-			}
 		}
 	}
 

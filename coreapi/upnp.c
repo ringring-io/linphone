@@ -145,7 +145,7 @@ char * linphone_upnp_format_device_id(const char *device_id) {
 	if(device_id == NULL) {
 		return ret;
 	}
-	ret = ms_new(char, UPNP_UUID_LEN + 1);
+	ret = ms_new0(char, UPNP_UUID_LEN + 1);
 	tmp = ret;
 	if(linphone_upnp_strncmpi(device_id, "uuid:", linphone_upnp_str_min(device_id, "uuid:")) == 0) {
 		device_id += strlen("uuid:");
@@ -607,7 +607,7 @@ int linphone_upnp_context_send_add_port_binding(UpnpContext *lupnp, UpnpPortBind
 		mapping.remote_port = port->external_port;
 		mapping.remote_host = "";
 		snprintf(description, 128, "%s %s at %s:%d",
-				PACKAGE_NAME,
+				"Linphone",
 				(port->protocol == UPNP_IGD_IP_PROTOCOL_TCP)? "TCP": "UDP",
 				port->local_addr, port->local_port);
 		mapping.description = description;
@@ -731,7 +731,7 @@ int linphone_core_update_upnp_from_remote_media_description(LinphoneCall *call, 
 	int i;
 	const SalStreamDescription *stream;
 
-	for (i = 0; i < md->n_total_streams; i++) {
+	for (i = 0; i < md->nb_streams; i++) {
 		stream = &md->streams[i];
 		if(stream->type == SalAudio) {
 			audio = TRUE;
@@ -834,12 +834,14 @@ int linphone_upnp_call_process(LinphoneCall *call) {
 				linphone_core_start_update_call(lc, call);
 				break;
 			case LinphoneCallUpdatedByRemote:
-				linphone_core_start_accept_call_update(lc, call);
+				linphone_core_start_accept_call_update(lc, call,call->prevstate,linphone_call_state_to_string(call->prevstate));
 				break;
 			case LinphoneCallOutgoingInit:
 				linphone_core_proceed_with_invite_if_ready(lc, call, NULL);
 				break;
 			case LinphoneCallIdle:
+				linphone_call_update_local_media_description_from_ice_or_upnp(call);
+				sal_call_set_local_media_description(call->op,call->localdesc);
 				linphone_core_notify_incoming_call(lc, call);
 				break;
 			default:
@@ -1058,8 +1060,9 @@ int linphone_core_update_local_media_description_from_upnp(SalMediaDescription *
 	SalStreamDescription *stream;
 	UpnpStream *upnpStream;
 
-	for (i = 0; i < desc->n_active_streams; i++) {
+	for (i = 0; i < desc->nb_streams; i++) {
 		stream = &desc->streams[i];
+		if (!sal_stream_description_active(stream)) continue;
 		upnpStream = NULL;
 		if(stream->type == SalAudio) {
 			upnpStream = session->audio;

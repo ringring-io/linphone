@@ -66,7 +66,24 @@ abstract public class LinphoneCoreFactory {
 	 * */
 	abstract public LinphoneAuthInfo createAuthInfo(String username, String userid, String passwd, String ha1, String realm, String domain);
 	
+	/**
+	 * Create a LinphoneCore object. The LinphoneCore is the root for all liblinphone operations. You need only one per application.
+	 * @param listener listener to receive notifications from the core
+	 * @param userConfig path where to read/write configuration (optional)
+	 * @param factoryConfig path where to read factory configuration (optional)
+	 * @param userdata any kind of application specific data
+	 * @param context an application context, on android this MUST be the android.content.Context object used by the application.
+	 * @return a LinphoneCore object.
+	 * @throws LinphoneCoreException
+	 */
 	abstract public LinphoneCore createLinphoneCore(LinphoneCoreListener listener, String userConfig,String factoryConfig,Object  userdata, Object context) throws LinphoneCoreException;
+	/**
+	 * Create a LinphoneCore object. The LinphoneCore is the root for all liblinphone operations. You need only one per application.
+	 * @param listener listener to receive notifications from the core.
+	 * @param context an application context, on android this MUST be the android.content.Context object used by the application.
+	 * @return the LinphoneCore object.
+	 * @throws LinphoneCoreException
+	 */
 	abstract public LinphoneCore createLinphoneCore(LinphoneCoreListener listener, Object context) throws LinphoneCoreException;
 
 
@@ -87,12 +104,10 @@ abstract public class LinphoneCoreFactory {
 	abstract public LinphoneAddress createLinphoneAddress(String address) throws LinphoneCoreException;
 	abstract public LpConfig createLpConfig(String file);
 	
-	abstract public LinphoneProxyConfig createProxyConfig(String identity, String proxy,String route,boolean enableRegister) throws LinphoneCoreException;
-	
 	/**
 	 * Enable verbose traces
-	 * @param enable 
-	 * @param tag
+	 * @param enable true to enable debug mode, false to disable it
+	 * @param tag Tag which prefixes each log message.
 	 */
 	abstract public  void setDebugMode(boolean enable, String tag);
 	

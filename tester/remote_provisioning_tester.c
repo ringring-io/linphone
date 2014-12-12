@@ -23,9 +23,10 @@
 #include "liblinphone_tester.h"
 
 void linphone_configuration_status(LinphoneCore *lc, LinphoneConfiguringState status, const char *message) {
+	stats* counters;
 	ms_message("Configuring state = %i with message %s", status, message?message:"");
 
-	stats* counters = get_stats(lc);
+	counters = get_stats(lc);
 	if (status == LinphoneConfiguringSkipped) {
 		counters->number_of_LinphoneConfiguringSkipped++;
 	} else if (status == LinphoneConfiguringFailed) {
@@ -76,6 +77,12 @@ static void remote_provisioning_invalid(void) {
 	linphone_core_manager_destroy(marie);
 }
 
+static void remote_provisioning_invalid_uri(void) {
+	LinphoneCoreManager* marie = linphone_core_manager_new2("marie_remote_invalid_uri_rc", FALSE);
+	CU_ASSERT_TRUE(wait_for(marie->lc,NULL,&marie->stat.number_of_LinphoneConfiguringFailed,1));
+	linphone_core_manager_destroy(marie);
+}
+
 static void remote_provisioning_default_values(void) {
 	LinphoneProxyConfig *lpc;
 	LinphoneCoreManager* marie = linphone_core_manager_new2("marie_remote_default_values_rc", FALSE);
@@ -83,16 +90,24 @@ static void remote_provisioning_default_values(void) {
 	lpc = linphone_core_create_proxy_config(marie->lc);
 	CU_ASSERT_TRUE(lpc->reg_sendregister == TRUE);
 	CU_ASSERT_TRUE(lpc->expires == 604800);
-	CU_ASSERT_TRUE(strcmp(lpc->reg_proxy, "<sip:sip.linphone.org:5223;transport=tls>") == 0);
-	CU_ASSERT_TRUE(strcmp(lpc->reg_route, "<sip:sip.linphone.org:5223;transport=tls>") == 0);
-	CU_ASSERT_TRUE(strcmp(lpc->reg_identity, "sip:?@sip.linphone.org") == 0);
+	CU_ASSERT_STRING_EQUAL(lpc->reg_proxy, "<sip:sip.linphone.org:5223;transport=tls>");
+	CU_ASSERT_STRING_EQUAL(lpc->reg_route, "<sip:sip.linphone.org:5223;transport=tls>");
+	CU_ASSERT_STRING_EQUAL(lpc->reg_identity, "sip:?@sip.linphone.org");
+	{
+		LpConfig* lp = linphone_core_get_config(marie->lc);
+		CU_ASSERT_STRING_EQUAL(lp_config_get_string(lp,"app","toto","empty"),"titi");
+	}
+
 	linphone_core_manager_destroy(marie);
 }
 
 static void remote_provisioning_file(void) {
 	LinphoneCoreManager* marie;
 	const LpConfig* conf;
-#if ANDROID
+#if TARGET_OS_IPHONE
+	ms_message("Skipping remote provisioning from file on iOS");
+	return;
+#elif defined(ANDROID)
 	marie = linphone_core_manager_new2("marie_remote_localfile_android_rc", FALSE);
 #else
 	marie = linphone_core_manager_new2("marie_remote_localfile_rc", FALSE);
@@ -114,7 +129,8 @@ test_t remote_provisioning_tests[] = {
 	{ "Remote provisioning invalid", remote_provisioning_invalid },
 	{ "Remote provisioning transient successful", remote_provisioning_transient },
 	{ "Remote provisioning default values", remote_provisioning_default_values },
-	{ "Remote provisioning from file", remote_provisioning_file }
+	{ "Remote provisioning from file", remote_provisioning_file },
+	{ "Remote provisioning invalid URI", remote_provisioning_invalid_uri }
 };
 
 test_suite_t remote_provisioning_test_suite = {

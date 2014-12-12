@@ -22,20 +22,10 @@
 #include "private.h"
 #include "liblinphone_tester.h"
 
-static void auth_info_requested2(LinphoneCore *lc, const char *realm, const char *username, const char *domain) {
-	stats* counters;
 
-	ms_message("Auth info requested  for user id [%s] at realm [%s]\n"
-					,username
-					,realm);
-	counters = get_stats(lc);
-	counters->number_of_auth_info_requested++;
-
-}
 
 static void auth_info_requested(LinphoneCore *lc, const char *realm, const char *username, const char *domain) {
 	LinphoneAuthInfo *info;
-	auth_info_requested2(lc,realm,username,domain);
 	info=linphone_auth_info_new(test_username,NULL,test_password,NULL,realm,domain); /*create authentication structure from identity*/
 	linphone_core_add_auth_info(lc,info); /*add authentication info to LinphoneCore*/
 }
@@ -46,7 +36,9 @@ static LinphoneCoreManager* create_lcm_with_auth(unsigned int with_auth) {
 	LinphoneCoreManager* mgr=linphone_core_manager_new(NULL);
 	
 	if (with_auth) {
-		mgr->lc->vtable.auth_info_requested=auth_info_requested;
+		LinphoneCoreVTable* vtable = linphone_core_v_table_new();
+		vtable->auth_info_requested=auth_info_requested;
+		linphone_core_add_listener(mgr->lc,vtable);
 	}
 	
 	/*to allow testing with 127.0.0.1*/
@@ -322,6 +314,7 @@ static void ha1_authenticated_register(){
 
 static void authenticated_register_with_no_initial_credentials(){
 	LinphoneCoreManager *mgr;
+	LinphoneCoreVTable* vtable = linphone_core_v_table_new();
 	stats* counters;
 	char route[256];
 	
@@ -329,7 +322,8 @@ static void authenticated_register_with_no_initial_credentials(){
 	
 	mgr = linphone_core_manager_new(NULL);
 	
-	mgr->lc->vtable.auth_info_requested=auth_info_requested;
+	vtable->auth_info_requested=auth_info_requested;
+	linphone_core_add_listener(mgr->lc,vtable);
 
 	counters= get_stats(mgr->lc);
 	counters->number_of_auth_info_requested=0;
@@ -387,8 +381,6 @@ static void authenticated_register_with_wrong_credentials_with_params_base(const
 	
 	sprintf(route,"sip:%s",test_route);
 	
-	mgr->lc->vtable.auth_info_requested=auth_info_requested2;
-
 	sal_set_refresher_retry_after(mgr->lc->sal,500);
 	if (user_agent) {
 		linphone_core_set_user_agent(mgr->lc,user_agent,NULL);
@@ -467,9 +459,12 @@ static void network_state_change(){
 	counters = get_stats(lc);
 	register_ok=counters->number_of_LinphoneRegistrationOk;
 	linphone_core_set_network_reachable(lc,FALSE);
+	CU_ASSERT_TRUE(wait_for(lc,lc,&counters->number_of_NetworkReachableFalse,1));
 	CU_ASSERT_TRUE(wait_for(lc,lc,&counters->number_of_LinphoneRegistrationNone,register_ok));
 	linphone_core_set_network_reachable(lc,TRUE);
+	CU_ASSERT_TRUE(wait_for(lc,lc,&counters->number_of_NetworkReachableTrue,1));
 	wait_for(lc,lc,&counters->number_of_LinphoneRegistrationOk,2*register_ok);
+
 	linphone_core_manager_destroy(mgr);
 }
 static int get_number_of_udp_proxy(const LinphoneCore* lc) {
@@ -681,7 +676,7 @@ static void io_recv_error_late_recovery(){
 	CU_ASSERT_TRUE(wait_for(lc,NULL,&counters->number_of_LinphoneRegistrationProgress,(register_ok-number_of_udp_proxy)+register_ok /*because 1 udp*/));
 	CU_ASSERT_EQUAL(counters->number_of_LinphoneRegistrationFailed,0)
 
-	CU_ASSERT_TRUE(wait_for_list(lcs=ms_list_append(NULL,lc),&counters->number_of_LinphoneRegistrationFailed,(register_ok-number_of_udp_proxy),sal_get_refresher_retry_after(lc->sal)+1000));
+	CU_ASSERT_TRUE(wait_for_list(lcs=ms_list_append(NULL,lc),&counters->number_of_LinphoneRegistrationFailed,(register_ok-number_of_udp_proxy),sal_get_refresher_retry_after(lc->sal)+3000));
 
 	sal_set_recv_error(lc->sal, 1); /*reset*/
 	sal_set_send_error(lc->sal, 0);
@@ -786,7 +781,7 @@ static void tls_alt_name_register(){
 	linphone_core_refresh_registers(mgr->lc);
 	CU_ASSERT_TRUE(wait_for(lc,lc,&mgr->stat.number_of_LinphoneRegistrationOk,1));
 	CU_ASSERT_EQUAL(mgr->stat.number_of_LinphoneRegistrationFailed,0);
-	linphone_core_destroy(mgr->lc);
+	linphone_core_manager_destroy(mgr);
 }
 
 static void tls_wildcard_register(){
@@ -802,6 +797,17 @@ static void tls_wildcard_register(){
 	CU_ASSERT_TRUE(wait_for(lc,lc,&mgr->stat.number_of_LinphoneRegistrationOk,2));
 	CU_ASSERT_EQUAL(mgr->stat.number_of_LinphoneRegistrationFailed,0);
 	linphone_core_destroy(mgr->lc);
+}
+
+static void redirect(){
+	char route[256];
+	LinphoneCoreManager* lcm;
+	LCSipTransports transport = {-1,0,0,0};
+	sprintf(route,"sip:%s:5064",test_route);
+	lcm = create_lcm();
+	linphone_core_set_user_agent(lcm->lc,"redirect",NULL);
+	register_with_refresh_base_2(lcm->lc,FALSE,test_domain,route,FALSE,transport);
+	linphone_core_manager_destroy(lcm);
 }
 
 test_t register_tests[] = {
@@ -835,7 +841,8 @@ test_t register_tests[] = {
 	{ "Io recv error", io_recv_error },
 	{ "Io recv error with recovery", io_recv_error_retry_immediatly},
 	{ "Io recv error with late recovery", io_recv_error_late_recovery},
-	{ "Io recv error without active registration", io_recv_error_without_active_register}
+	{ "Io recv error without active registration", io_recv_error_without_active_register},
+	{ "Simple redirect", redirect}
 };
 
 test_suite_t register_test_suite = {
