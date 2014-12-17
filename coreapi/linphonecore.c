@@ -5651,9 +5651,13 @@ MSVideoSize linphone_core_get_preview_video_size(const LinphoneCore *lc){
 **/
 MSVideoSize linphone_core_get_current_preview_video_size(const LinphoneCore *lc){
 	MSVideoSize ret={0};
+#ifndef VIDEO_ENABLED
+	ms_error("linphone_core_get_current_preview_video_size() fail. Support for video is disabled");
+#else
 	if (lc->previewstream){
 		ret=video_preview_get_current_size(lc->previewstream);
 	}
+#endif
 	return ret;
 }
 
@@ -6439,20 +6443,20 @@ static void notify_soundcard_usage(LinphoneCore *lc, bool_t used){
 void linphone_core_soundcard_hint_check( LinphoneCore* lc){
 	MSList* the_calls = lc->calls;
 	LinphoneCall* call = NULL;
-	bool_t remaining_paused = FALSE;
+	bool_t dont_need_sound = TRUE;
 
 	/* check if the remaining calls are paused */
 	while( the_calls ){
 		call = the_calls->data;
-		if( call->state == LinphoneCallPausing || call->state == LinphoneCallPaused ){
-			remaining_paused = TRUE;
+		if( call->state != LinphoneCallPausing && call->state != LinphoneCallPaused ){
+			dont_need_sound = FALSE;
 			break;
 		}
 		the_calls = the_calls->next;
 	}
 
 	/* if no more calls or all calls are paused, we can free the soundcard */
-	if ( (lc->calls==NULL || remaining_paused) && !lc->use_files){
+	if ( (lc->calls==NULL || dont_need_sound) && !lc->use_files){
 		ms_message("Notifying soundcard that we don't need it anymore for calls.");
 		notify_soundcard_usage(lc,FALSE);
 	}
